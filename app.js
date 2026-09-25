@@ -1,7 +1,7 @@
 /* Daybook: a private, offline journal. All data lives in this device's IndexedDB. */
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 
 /* ---------- small utilities ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -19,7 +19,7 @@ const fmtLong = (d) => d.toLocaleDateString('en-US', { weekday: 'long', month: '
 const fmtShort = (d) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 const fmtTime = (d) => d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
 const isoZ = (x) => new Date(x).toISOString().replace(/\.\d{3}Z$/, 'Z');
-const wordCount = (t) => (String(t).match(/\S+/g) || []).length;
+const wordCount = (t) => (stripMoments(t).match(/\S+/g) || []).length;
 const debounce = (fn, ms) => { let t; const f = (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; f.flush = (...a) => { clearTimeout(t); return fn(...a); }; f.cancel = () => clearTimeout(t); return f; };
 const fmtBytes = (n) => n > 1e9 ? (n / 1e9).toFixed(2) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB';
 
@@ -193,7 +193,38 @@ function md(src) {
   }
   flushP(); flushL(); return out.join('');
 }
-const plain = (s) => s.replace(/^#{1,3}\s+/gm, '').replace(/[*_`>]/g, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+/* Inline photos use Day One's marker syntax on a line of their own: ![](dayone-moment://ID) */
+const MOMENT_RE = /!\[[^\]]*\]\(dayone-moment:\/\/([A-Za-z0-9_-]+)\)/g;
+const MOMENT_LINE = /^!\[[^\]]*\]\(dayone-moment:\/\/([A-Za-z0-9_-]+)\)$/;
+function stripMoments(t) { return String(t || '').replace(/[ \t]*!\[[^\]]*\]\(dayone-moment:\/*[^)]*\)[ \t]*\n?/g, ''); }
+function toBlocks(e) {
+  const raw = [], seen = new Set(), valid = new Set(e.photos || []); let buf = [];
+  const flush = () => { raw.push({ t: 'text', v: buf.join('\n').replace(/^\n+|\n+$/g, '') }); buf = []; };
+  for (const ln of String(e.text || '').split('\n')) {
+    const m = ln.trim().match(MOMENT_LINE);
+    if (m) { if (valid.has(m[1]) && !seen.has(m[1])) { flush(); raw.push({ t: 'photo', id: m[1] }); seen.add(m[1]); } }
+    else buf.push(ln);
+  }
+  flush();
+  for (const id of e.photos || []) if (!seen.has(id)) raw.push({ t: 'photo', id }); // older entries: photos go after the text
+  const out = [];
+  for (const b of raw) {
+    if (b.t === 'text' && out.length && out[out.length - 1].t === 'text') { const a = out[out.length - 1]; a.v = [a.v, b.v].filter((x) => x.trim()).join('\n\n'); continue; }
+    if (b.t === 'photo' && (!out.length || out[out.length - 1].t === 'photo')) out.push({ t: 'text', v: '' });
+    out.push(b);
+  }
+  if (!out.length || out[out.length - 1].t === 'photo') out.push({ t: 'text', v: '' });
+  return out;
+}
+function fromBlocks(blocks) {
+  const parts = [], photos = [];
+  for (const b of blocks) {
+    if (b.t === 'photo') { parts.push(`![](dayone-moment://${b.id})`); photos.push(b.id); }
+    else if (b.v.trim()) parts.push(b.v.replace(/^\n+|\n+$/g, ''));
+  }
+  return { text: parts.join('\n\n'), photos };
+}
+const plain = (s) => stripMoments(s).replace(/^#{1,3}\s+/gm, '').replace(/[*_`>]/g, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
 function titleSnip(text) {
   const lines = plain(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
   return { title: lines[0] || '', snip: lines.slice(1).join(' ') };
@@ -335,7 +366,7 @@ function renderSearchResults() {
   const q = S.search.q.trim(); const ql = q.toLowerCase();
   const res = all.filter((e) => (!S.search.starred || e.starred)
     && [...S.search.tags].every((t) => (e.tags || []).includes(t))
-    && (!ql || e.text.toLowerCase().includes(ql) || (e.tags || []).some((t) => t.toLowerCase().includes(ql)) || (e.location && (e.location.name || '').toLowerCase().includes(ql))));
+    && (!ql || stripMoments(e.text).toLowerCase().includes(ql) || (e.tags || []).some((t) => t.toLowerCase().includes(ql)) || (e.location && (e.location.name || '').toLowerCase().includes(ql))));
   const active = q || S.search.starred || S.search.tags.size;
   $('#search-res').innerHTML = !active ? `<p class="note">Search words, tags and places. Tap a tag to filter.</p>`
     : `<p class="note">${res.length} result${res.length === 1 ? '' : 's'}</p>` + res.slice(0, 200).map((e) => entryCard(e, q)).join('');
@@ -384,8 +415,7 @@ function renderReader(el) {
       <div class="ttl">${esc(d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }))}<small>${esc(fmtTime(d))}</small></div>
       <button class="txtbtn r" data-a="edit">Edit</button></header>
     <div class="scroll reader">
-      <div class="md">${md(e.text) || '<p style="color:var(--muted)">No text.</p>'}</div>
-      ${e.photos && e.photos.length ? `<div class="pics">${e.photos.map((p) => `<img data-photo="${p}" alt="">`).join('')}</div>` : ''}
+      <div class="md">${toBlocks(e).map((b) => b.t === 'photo' ? `<img class="inl" data-photo="${b.id}" alt="">` : (b.v.trim() ? md(b.v) : '')).join('') || '<p style="color:var(--muted)">No text.</p>'}</div>
       <div class="card facts">${facts}</div>
       <div class="row" style="justify-content:space-between;margin-top:14px">
         <button class="btn ghost" data-a="star">${e.starred ? 'Unstar' : 'Star'}</button>
@@ -436,8 +466,7 @@ function openEditor(existing, onDate) {
       <div class="ttl" style="position:relative"><span id="ed-when"></span><small>Tap to change date</small>
         <input type="datetime-local" id="ed-date" style="position:absolute;inset:0;opacity:0;width:100%" aria-label="Entry date"></div>
       <button class="txtbtn r" data-a="done">Done</button></header>
-    <div class="scroll"><div class="ed-meta" id="ed-meta"></div><div class="photos" id="ed-photos"></div>
-      <textarea id="ed-text" placeholder="What's on your mind?"></textarea></div>
+    <div class="scroll"><div class="ed-meta" id="ed-meta"></div><div id="ed-body"></div></div>
     <div id="ed-pop"></div>
     <div class="toolbar">
       <label aria-label="Add photos">${ic('camera')}<input type="file" accept="image/*" multiple hidden id="ed-file"></label>
@@ -447,10 +476,43 @@ function openEditor(existing, onDate) {
       <button data-a="star" aria-label="Star">${ic('star')}</button>
       <button data-a="prompt" aria-label="Prompts and templates">${ic('bulb')}</button>
     </div>`);
-  const ta = $('#ed-text', el), pop = $('#ed-pop', el);
-  ta.value = e.text;
-  const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.max(ta.scrollHeight, window.innerHeight * 0.45) + 'px'; };
-  ta.addEventListener('input', () => { e.text = ta.value; grow(); changed(); });
+  const pop = $('#ed-pop', el), body = $('#ed-body', el);
+  let blocks = toBlocks(e), lastTA = null;
+  const sync = () => { const r = fromBlocks(blocks); e.text = r.text; e.photos = r.photos; };
+  const growTA = (ta) => {
+    const i = +ta.dataset.i; ta.style.height = 'auto';
+    const min = blocks.length === 1 ? window.innerHeight * 0.45 : i === blocks.length - 1 ? 140 : 34;
+    ta.style.height = Math.max(ta.scrollHeight, min) + 'px';
+  };
+  const paintBody = (focusIdx, caret) => {
+    body.innerHTML = blocks.map((b, i) => b.t === 'photo'
+      ? `<div class="ph-inl"><img data-photo="${b.id}" alt=""><button class="x" data-rm="${b.id}" aria-label="Remove photo">×</button></div>`
+      : `<textarea class="ed-text" data-i="${i}" rows="1" placeholder="${i === 0 ? "What's on your mind?" : i === blocks.length - 1 ? 'Keep writing…' : 'Add text'}"></textarea>`).join('');
+    $$('textarea', body).forEach((ta) => { ta.value = blocks[+ta.dataset.i].v; growTA(ta); });
+    hydrate(body);
+    lastTA = null;
+    if (focusIdx != null) { const ta = $(`textarea[data-i="${focusIdx}"]`, body); if (ta) { ta.focus(); if (caret != null) ta.setSelectionRange(caret, caret); lastTA = ta; } }
+  };
+  body.addEventListener('input', (ev) => {
+    const ta = ev.target.closest('textarea'); if (!ta) return;
+    blocks[+ta.dataset.i].v = ta.value; growTA(ta); lastTA = ta; sync(); changed();
+  });
+  body.addEventListener('focusin', (ev) => { if (ev.target.matches('textarea')) lastTA = ev.target; });
+  const insertPhotos = (ids) => {
+    let i, pos;
+    if (lastTA && body.contains(lastTA)) { i = +lastTA.dataset.i; pos = lastTA.selectionStart ?? lastTA.value.length; }
+    else { i = blocks.length - 1; pos = blocks[i].v.length; }
+    const v = blocks[i].v, mid = [];
+    ids.forEach((id, k) => { if (k) mid.push({ t: 'text', v: '' }); mid.push({ t: 'photo', id }); });
+    blocks.splice(i, 1, { t: 'text', v: v.slice(0, pos).replace(/\s+$/, '') }, ...mid, { t: 'text', v: v.slice(pos).replace(/^\s+/, '') });
+    sync(); paintBody(i + mid.length + 1, 0);
+  };
+  const removePhoto = (id) => {
+    const k = blocks.findIndex((b) => b.t === 'photo' && b.id === id); if (k < 0) return;
+    const prev = blocks[k - 1], next = blocks[k + 1], caret = prev.v.length;
+    prev.v = [prev.v, next.v].filter((x) => x.trim()).join('\n\n');
+    blocks.splice(k, 2); sync(); paintBody(k - 1, caret);
+  };
 
   const paintWhen = () => { const d = new Date(e.created); $('#ed-when', el).textContent = `${fmtShort(d)}, ${fmtTime(d)}`; $('#ed-date', el).value = toLocalInput(d); };
   $('#ed-date', el).addEventListener('change', (ev) => { if (!ev.target.value) return; e.created = new Date(ev.target.value).toISOString(); paintWhen(); changed(); });
@@ -466,22 +528,20 @@ function openEditor(existing, onDate) {
     const sj = $('[data-journal]', el); if (sj) sj.onchange = () => { e.journal = sj.value; changed(); };
     $('[data-a=star]', el).classList.toggle('on', e.starred);
   };
-  const paintPhotos = () => {
-    $('#ed-photos', el).innerHTML = e.photos.map((p) => `<div class="ph"><img data-photo="${p}" data-thumb alt=""><button class="x" data-rm="${p}" aria-label="Remove photo">×</button></div>`).join('');
-    hydrate($('#ed-photos', el));
-  };
-  paintWhen(); paintMeta(); paintPhotos(); requestAnimationFrame(grow);
-  if (isNew) setTimeout(() => ta.focus(), 250);
+  paintWhen(); paintMeta(); paintBody();
+  if (isNew) setTimeout(() => { const t0 = $('textarea', body); if (t0) { t0.focus(); lastTA = t0; } }, 250);
 
   $('#ed-file', el).addEventListener('change', async (ev) => {
     const files = [...ev.target.files]; ev.target.value = '';
     if (!files.length) return;
     toast(`Adding ${files.length} photo${files.length > 1 ? 's' : ''}…`);
+    const ids = [];
     for (const f of files) {
-      try { const p = await makePhoto(f); await DB.put('photos', p); e.photos.push(p.id); dirty = true; }
+      try { const p = await makePhoto(f); await DB.put('photos', p); ids.push(p.id); }
       catch (err) { toast(err.message); }
     }
-    paintPhotos(); await persist();
+    if (!ids.length) return;
+    insertPhotos(ids); dirty = true; await persist();
   });
 
   const showPop = (html) => { pop.innerHTML = html ? `<div class="pop">${html}</div>` : ''; };
@@ -518,7 +578,7 @@ function openEditor(existing, onDate) {
     const rm = ev.target.closest('[data-rm]');
     if (rm) {
       if (!confirm('Remove this photo from the entry?')) return;
-      e.photos = e.photos.filter((p) => p !== rm.dataset.rm); await deletePhotos([rm.dataset.rm]); paintPhotos(); dirty = true; await persist(); return;
+      removePhoto(rm.dataset.rm); await deletePhotos([rm.dataset.rm]); dirty = true; await persist(); return;
     }
     const ph = ev.target.closest('img[data-photo]'); if (ph) return viewPhoto(ph.dataset.photo);
     const ut = ev.target.closest('[data-untag]'); if (ut) { e.tags = e.tags.filter((t) => t !== ut.dataset.untag); paintMeta(); changed(); tagPop(); return; }
@@ -574,9 +634,11 @@ function openEditor(existing, onDate) {
     }
   });
   function insertText(t) {
+    const ta = lastTA && body.contains(lastTA) ? lastTA : $('textarea', body);
     const s = ta.selectionStart ?? ta.value.length;
     ta.value = ta.value.slice(0, s) + t + ta.value.slice(ta.selectionEnd ?? s);
-    e.text = ta.value; grow(); changed(); ta.focus();
+    blocks[+ta.dataset.i].v = ta.value; growTA(ta); sync(); changed();
+    ta.focus(); ta.setSelectionRange(s + t.length, s + t.length); lastTA = ta;
   }
 }
 
@@ -595,7 +657,9 @@ async function buildBackup() {
       photos.push({ identifier: pid, md5: h, type: ext, width: p.w, height: p.h, orderInEntry: i });
     });
     let text = e.text;
-    if (photos.length) text += (text ? '\n\n' : '') + photos.map((p) => `![](dayone-moment://${p.identifier})`).join('\n');
+    const placed = new Set([...String(e.text).matchAll(MOMENT_RE)].map((m) => m[1]));
+    const loose = photos.filter((p) => !placed.has(p.identifier));
+    if (loose.length) text += (text ? '\n\n' : '') + loose.map((p) => `![](dayone-moment://${p.identifier})`).join('\n\n');
     const o = { uuid: e.id, creationDate: isoZ(e.created), modifiedDate: isoZ(e.modified || e.created), timeZone: e.tz || TZ,
       text, tags: e.tags || [], starred: !!e.starred, daybook: { journal: e.journal, mood: e.mood || null } };
     if (e.location) o.location = { latitude: e.location.lat, longitude: e.location.lon, placeName: e.location.name || '' };
@@ -626,7 +690,7 @@ function buildMarkdown() {
       e.tags && e.tags.length ? `Tags: ${e.tags.map((t) => '#' + t).join(' ')}` : '', e.starred ? 'Starred' : '',
       e.photos && e.photos.length ? `${e.photos.length} photo(s) (in the full backup)` : ''].filter(Boolean);
     if (meta.length) out += `*${meta.join(' · ')}*\n\n`;
-    out += e.text.trim() + '\n';
+    out += e.text.replace(MOMENT_RE, '*(photo)*').trim() + '\n';
   }
   return new Blob([out], { type: 'text/markdown' });
 }
@@ -698,10 +762,7 @@ async function importFile(file) {
       const modified = de.modifiedDate || created;
       const ex = S.entries.find((x) => x.id === id);
       if (ex && ex.modified && new Date(ex.modified) >= new Date(modified)) { r.skipped++; continue; }
-      let text = String(de.text || '')
-        .replace(/!\[[^\]]*\]\(dayone-moment:\/*[^)]*\)\n?/g, '')
-        .replace(/\\([\\`*_{}[\]()#+\-.!>|~])/g, '$1').trim();
-      const photoIds = [];
+      const photoIds = [], idMap = new Map();
       for (const p of de.photos || []) {
         const f = zip && p.md5 ? zip.file(new RegExp(`(^|/)photos/${p.md5}\\.[a-z0-9]+$`, 'i'))[0] : null;
         if (!f) { r.missing++; continue; }
@@ -710,8 +771,12 @@ async function importFile(file) {
         const rec = { id: p.identifier || uuid(), type, data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
           w: p.width, h: p.height, md5: p.md5, created };
         try { const { im, u } = await loadImg(new Blob([bytes], { type })); rec.thumb = (await scaleTo(im, 360, 0.72)).buf; URL.revokeObjectURL(u); } catch (_) { /* thumbnail optional */ }
-        await DB.put('photos', rec); photoIds.push(rec.id); r.photos++;
+        await DB.put('photos', rec); photoIds.push(rec.id); if (p.identifier) idMap.set(p.identifier, rec.id); r.photos++;
       }
+      const text = String(de.text || '')
+        .replace(/\\([\\`*_{}[\]()#+\-.!>|~])/g, '$1')
+        .replace(/[ \t]*!\[[^\]]*\]\(dayone-moment:(\/*)([^)]*)\)[ \t]*/g, (m, sl, id) => (sl === '//' && idMap.has(id) ? `\n\n![](dayone-moment://${idMap.get(id)})\n\n` : ''))
+        .replace(/\n{3,}/g, '\n\n').trim();
       const loc = de.location && de.location.latitude != null ? { lat: de.location.latitude, lon: de.location.longitude,
         name: de.location.placeName || [de.location.localityName, de.location.administrativeArea].filter(Boolean).join(', ') } : null;
       const w = de.weather ? { tempC: de.weather.temperatureCelsius ?? null, desc: de.weather.conditionsDescription || '' } : null;

@@ -27,6 +27,7 @@ What Daybook copies: Day One's timeline, calendar, photo grid, On This Day, tags
 - Timeline grouped by month, with entry count, day streak and word count
 - On This Day card for entries from the same date in earlier years
 - Calendar with dots on days that have entries; write an entry for any past day
+- Photos inline with the text, like Day One: add a photo and it lands where the cursor is, so an entry can run text, photo, text, photo
 - Photos grid; photos shrink to 2048 px JPEG on import to save space
 - Full-text search across text, tags and place names; filter by tag or star
 - Markdown formatting: headings, bold, italic, lists, quotes, links
@@ -37,14 +38,14 @@ What Daybook copies: Day One's timeline, calendar, photo grid, On This Day, tags
 - Recently Deleted, kept 30 days
 - 4-digit passcode with auto-lock (privacy screen; not encryption)
 - Backup: a .zip in Day One's export format (JSON plus photos folder named by MD5). Restores into Daybook; should also import into Day One (not tested against Day One itself)
-- Import: Daybook backups, Day One .zip exports and Day One .json files
+- Import: Daybook backups, Day One .zip exports and Day One .json files. Day One photos keep their place in the text; Day One video, audio and PDF items are skipped
 - Markdown export of every entry
 - Reminder banner when the last backup is more than 14 days old
 - Light and dark mode
 
 ## What was tested (Chromium, iPhone-sized viewport)
 
-Create, edit, photo, mood, tags, location, star, backdated entry, On This Day, calendar, search, photos grid, passcode set and unlock, full reload with the network off (app shell and entries load from cache), backup and restore into a clean browser, re-import skipping unchanged entries, Day One JSON import (escaped punctuation, place name, weather). MD5 matches the standard test vectors. Not tested on a physical iPhone.
+Create, edit, photo, mood, tags, location, star, backdated entry, On This Day, calendar, search, photos grid, passcode set and unlock, full reload with the network off (app shell and entries load from cache), backup and restore into a clean browser, re-import skipping unchanged entries, Day One JSON import (escaped punctuation, place name, weather). MD5 matches the standard test vectors. Version 1.1.0 (2026-09-25, inline photos): photo placement at the cursor, removing a photo, reader order, entries made in 1.0.0 (photos shown after the text), search ignoring photo markers, backup and restore keeping order, Day One import keeping order, the update from 1.0.0 to 1.1.0 and an offline reload afterward. Not tested on a physical iPhone.
 
 ## Install on the iPhone
 
