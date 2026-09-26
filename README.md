@@ -104,7 +104,7 @@ The journal exists only on the device. Deleting the Home Screen icon deletes the
 
 ## Updating the app
 
-Change the files, bump `VERSION` in `sw.js`, and re-upload. The installed app shows "A new version is ready" the next time it opens or comes back to the screen with a network connection (from 1.3.1 on; earlier versions only checked when relaunched); tap Reload. GitHub may serve the old files for up to 10 minutes after an upload. Do this on each device. Update both devices before syncing between them: a device on a version before 1.3.0 has no sync.
+Change the files, bump `VERSION` in `sw.js`, and re-upload. The installed app shows "A new version is ready" the next time it opens or comes back to the screen with a network connection (from 1.3.1 on; earlier versions only checked when relaunched); tap Reload. GitHub may serve the old files for up to 10 minutes after an upload. From 1.3.2 on, the notice floats above every tab and panel, the app asks GitHub for the update file directly instead of a copy the phone kept, and a new version fetches all of its files fresh. Do this on each device. Update both devices before syncing between them: a device on a version before 1.3.0 has no sync.
 
 ## Limits compared with a native app
 

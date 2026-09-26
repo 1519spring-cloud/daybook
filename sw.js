@@ -1,10 +1,11 @@
 // Daybook service worker: cache-first app shell so the app opens with no network.
-const VERSION = 'daybook-v1.3.1';
+const VERSION = 'daybook-v1.3.2';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './app.js', './jszip.min.js',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)));
+  // cache: 'reload' fetches every file fresh from GitHub, so a new version never stores stale copies of the old files
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' })))));
 });
 
 self.addEventListener('activate', (e) => {

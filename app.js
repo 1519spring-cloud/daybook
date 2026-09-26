@@ -1,7 +1,7 @@
 /* Daybook: a private, offline journal. All data lives in this device's IndexedDB. */
 'use strict';
 
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.2';
 
 /* ---------- small utilities ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -286,7 +286,6 @@ function computeStats(list) {
 }
 function backupBanner() {
   const n = S.entries.filter((e) => !e.deleted).length;
-  if (S.updateReady) return `<div class="banner">${ic('in')}<span>A new version of Daybook is ready.</span><button data-act="update">Reload</button></div>`;
   if (!n) return '';
   const age = S.lastBackup ? (Date.now() - new Date(S.lastBackup)) / 864e5 : Infinity;
   if (age < 14) return '';
@@ -296,7 +295,21 @@ function backupBanner() {
 
 /* ---------- main views ---------- */
 const main = () => $('#main');
+// the update notice floats above every tab and panel, so it can't be missed
+function showUpdate() {
+  if (!S.updateReady || S.updateLater || $('#upd')) return;
+  const b = document.createElement('div'); b.id = 'upd'; b.className = 'banner';
+  b.innerHTML = `${ic('in')}<span>A new version of Daybook is ready.</span><button data-go>Reload</button><button data-later aria-label="Later" style="margin-left:4px;font-size:20px;color:var(--muted)">×</button>`;
+  $('[data-later]', b).addEventListener('click', () => { b.remove(); S.updateLater = true; }); // shows again next time Daybook opens
+  $('[data-go]', b).addEventListener('click', async () => {
+    const ed = $$('.sheet').find((x) => x._done); if (ed) { ed._done(); await new Promise((r) => setTimeout(r, 300)); } // save an open entry first
+    $('[data-go]', b).textContent = 'Updating…'; S.updateReady.postMessage('skipWaiting');
+    setTimeout(() => location.reload(), 4000); // in case the switch-over event never arrives
+  });
+  document.body.appendChild(b);
+}
 function render() {
+  showUpdate();
   if (S.map) { try { S.map.remove(); } catch (_) { /* already gone */ } S.map = null; }
   const titles = { timeline: 'Journal', calendar: 'Calendar', media: 'Photos', map: 'Map', search: 'Search' };
   $('#view-title').textContent = S.filter !== 'all' && S.view === 'timeline' ? jname(S.filter) : titles[S.view];
@@ -1437,7 +1450,6 @@ function wire() {
       case 'f-star': S.search.starred = !S.search.starred; renderSearchResults(); break;
       case 'backup': doBackup(); break;
       case 'share': openShare(); break;
-      case 'update': if (S.updateReady) { S.updateReady.postMessage('skipWaiting'); } break;
     }
   });
   document.addEventListener('keydown', onKey);
@@ -1477,7 +1489,9 @@ function onKey(ev) {
 
 function registerSW() {
   if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
-  navigator.serviceWorker.register('sw.js').then((reg) => {
+  // updateViaCache 'none': always ask GitHub for sw.js itself, never a copy the phone kept
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((reg) => {
+    if (navigator.onLine) reg.update().catch(() => {});
     const watch = (w) => w && w.addEventListener('statechange', () => {
       if (w.state === 'installed' && navigator.serviceWorker.controller) { S.updateReady = w; render(); }
     });
