@@ -1,7 +1,7 @@
 /* Daybook: a private, offline journal. All data lives in this device's IndexedDB. */
 'use strict';
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 
 /* ---------- small utilities ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -469,12 +469,12 @@ function openEditor(existing, onDate) {
     <div class="scroll"><div class="ed-meta" id="ed-meta"></div><div id="ed-body"></div></div>
     <div id="ed-pop"></div>
     <div class="toolbar">
-      <label aria-label="Add photos">${ic('camera')}<input type="file" accept="image/*" multiple hidden id="ed-file"></label>
-      <button data-a="tags" aria-label="Tags">${ic('tag')}</button>
-      <button data-a="mood" aria-label="Mood">${ic('smile')}</button>
-      <button data-a="loc" aria-label="Location">${ic('pin')}</button>
-      <button data-a="star" aria-label="Star">${ic('star')}</button>
-      <button data-a="prompt" aria-label="Prompts and templates">${ic('bulb')}</button>
+      <label aria-label="Add photos">${ic('camera')}Photo<input type="file" accept="image/*" multiple hidden id="ed-file"></label>
+      <button data-a="tags" aria-label="Tags">${ic('tag')}Tags</button>
+      <button data-a="mood" aria-label="Mood">${ic('smile')}Mood</button>
+      <button data-a="loc" aria-label="Location">${ic('pin')}Place</button>
+      <button data-a="star" aria-label="Star">${ic('star')}Star</button>
+      <button data-a="prompt" aria-label="Prompts and templates">${ic('bulb')}Ideas</button>
     </div>`);
   const pop = $('#ed-pop', el), body = $('#ed-body', el);
   let blocks = toBlocks(e), lastTA = null;
@@ -956,10 +956,22 @@ function registerSW() {
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (S.updateReady && !reloaded) { reloaded = true; location.reload(); } });
 }
 
+function fitToKeyboard() {
+  const vv = window.visualViewport; if (!vv) return;
+  const root = document.documentElement.style;
+  const apply = () => {
+    root.setProperty('--vvh', vv.height + 'px');
+    root.setProperty('--vvt', vv.offsetTop + 'px');
+    // keyboard open: the home-indicator padding is not needed above the keyboard
+    root.setProperty('--kb-sb', window.innerHeight - vv.height > 120 ? '0px' : 'env(safe-area-inset-bottom, 0px)');
+  };
+  vv.addEventListener('resize', apply); vv.addEventListener('scroll', apply); apply();
+}
+
 (async function init() {
   try {
     await DB.open(); await loadAll(); await purgeTrash();
-    wire(); render(); registerSW();
+    wire(); fitToKeyboard(); render(); registerSW();
     if (S.lock) lockNow();
   } catch (err) {
     document.body.innerHTML = `<div class="empty"><h2>Daybook could not open its storage</h2><p>${esc(err.message)}</p><p>If this is a Private Browsing tab, open Daybook in a normal tab or from the Home Screen.</p></div>`;
