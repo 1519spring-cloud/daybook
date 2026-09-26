@@ -1,5 +1,5 @@
 // Daybook service worker: cache-first app shell so the app opens with no network.
-const VERSION = 'daybook-v1.3.0';
+const VERSION = 'daybook-v1.3.1';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './app.js', './jszip.min.js',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 

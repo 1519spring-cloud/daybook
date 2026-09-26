@@ -1,7 +1,7 @@
 /* Daybook: a private, offline journal. All data lives in this device's IndexedDB. */
 'use strict';
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 
 /* ---------- small utilities ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -1483,6 +1483,12 @@ function registerSW() {
     });
     if (reg.waiting && navigator.serviceWorker.controller) { S.updateReady = reg.waiting; render(); }
     reg.addEventListener('updatefound', () => watch(reg.installing));
+    // an installed app is usually resumed, not relaunched, so also check for a new version each time it comes back to the screen
+    let lastCheck = Date.now();
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden || !navigator.onLine || Date.now() - lastCheck < 60000) return;
+      lastCheck = Date.now(); reg.update().catch(() => {});
+    });
   }).catch(() => {});
   let reloaded = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (S.updateReady && !reloaded) { reloaded = true; location.reload(); } });
