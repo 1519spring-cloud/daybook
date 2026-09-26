@@ -1,7 +1,7 @@
 /* Daybook: a private, offline journal. All data lives in this device's IndexedDB. */
 'use strict';
 
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.3.0';
 
 /* ---------- small utilities ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -21,6 +21,13 @@ const fmtTime = (d) => d.toLocaleTimeString('en-US', { hour: 'numeric', minute: 
 const isoZ = (x) => new Date(x).toISOString().replace(/\.\d{3}Z$/, 'Z');
 const wordCount = (t) => (stripMoments(t).match(/\S+/g) || []).length;
 const debounce = (fn, ms) => { let t; const f = (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; f.flush = (...a) => { clearTimeout(t); return fn(...a); }; f.cancel = () => clearTimeout(t); return f; };
+const IS_IPAD = /iPad/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const IS_MAC = /Macintosh/.test(navigator.userAgent) && !IS_IPAD;
+const IS_IPHONE = /iPhone|iPod/.test(navigator.userAgent);
+const DEVICE = IS_MAC ? 'Mac' : IS_IPAD ? 'iPad' : IS_IPHONE ? 'iPhone' : /Windows/.test(navigator.userAgent) ? 'PC' : /Android/.test(navigator.userAgent) ? 'phone' : 'computer';
+const HERE = IS_IPHONE || /Android/.test(navigator.userAgent) ? 'this phone' : 'this ' + DEVICE;
+const POINTER = window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+const TAP = POINTER ? 'Click' : 'Tap', tap = POINTER ? 'click' : 'tap';
 const fmtBytes = (n) => n > 1e9 ? (n / 1e9).toFixed(2) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1e3)) + ' KB';
 
 function toast(msg, ms = 2400) {
@@ -88,7 +95,7 @@ const S = {
   entries: [], journals: [], view: 'timeline', filter: 'all', limit: 120,
   calMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1), calSel: dayKey(new Date()),
   search: { q: '', tags: new Set(), starred: false },
-  lock: null, lockAfter: 1, lastBackup: null, hiddenAt: 0, locked: false, updateReady: null,
+  lock: null, lockAfter: 1, lastBackup: null, autoTag: true, mapTag: '', map: null, hiddenAt: 0, locked: false, updateReady: null,
 };
 const jname = (id) => (S.journals.find((j) => j.id === id) || { name: 'Journal' }).name;
 const live = () => S.entries.filter((e) => !e.deleted && (S.filter === 'all' || e.journal === S.filter))
@@ -101,6 +108,7 @@ async function loadAll() {
   S.lock = await DB.meta('lock', null);
   S.lockAfter = await DB.meta('lockAfter', 1);
   S.lastBackup = await DB.meta('lastBackup', null);
+  S.autoTag = await DB.meta('autoTag', true);
   if (S.filter !== 'all' && !S.journals.some((j) => j.id === S.filter)) S.filter = 'all';
 }
 
@@ -138,11 +146,12 @@ async function scaleTo(im, max, q) {
   return { buf: await b.arrayBuffer(), w, h };
 }
 async function makePhoto(blob) {
+  const exif = readExif(await blob.arrayBuffer()); // read before re-encoding, which drops EXIF
   const { im, u } = await loadImg(blob);
   try {
     const full = await scaleTo(im, 2048, 0.85), th = await scaleTo(im, 360, 0.72);
-    return { id: uuid(), type: 'image/jpeg', data: full.buf, thumb: th.buf, w: full.w, h: full.h,
-      md5: md5(new Uint8Array(full.buf)), created: new Date().toISOString() };
+    return { rec: { id: uuid(), type: 'image/jpeg', data: full.buf, thumb: th.buf, w: full.w, h: full.h,
+      md5: md5(new Uint8Array(full.buf)), created: new Date().toISOString() }, exif };
   } finally { URL.revokeObjectURL(u); }
 }
 async function deletePhotos(ids) {
@@ -160,9 +169,15 @@ async function saveEntry(e) {
   if (i >= 0) S.entries[i] = e; else S.entries.push(e);
   if (navigator.storage && navigator.storage.persist && !saveEntry._asked) { saveEntry._asked = true; navigator.storage.persist().catch(() => {}); }
 }
-async function hardDelete(e) {
+async function hardDelete(e, tomb = true) {
   await deletePhotos(e.photos); await DB.del('entries', e.id);
   S.entries = S.entries.filter((x) => x.id !== e.id);
+  // remember the deletion for a year so a sync file can remove the entry on the other device too
+  if (tomb) {
+    const cut = Date.now() - 365 * 864e5;
+    const t = (await DB.meta('tombstones', [])).filter((x) => x.id !== e.id && new Date(x.at).getTime() > cut);
+    t.push({ id: e.id, at: new Date().toISOString() }); await DB.setMeta('tombstones', t);
+  }
 }
 async function purgeTrash() {
   const cutoff = Date.now() - 30 * 864e5;
@@ -276,25 +291,26 @@ function backupBanner() {
   const age = S.lastBackup ? (Date.now() - new Date(S.lastBackup)) / 864e5 : Infinity;
   if (age < 14) return '';
   const when = S.lastBackup ? `Last backup ${Math.floor(age)} days ago.` : 'Not backed up yet.';
-  return `<div class="banner">${ic('db')}<span>${when} Your journal lives only on this phone.</span><button data-act="backup">Back up</button></div>`;
+  return `<div class="banner">${ic('db')}<span>${when} Your journal lives only on ${HERE}.</span><button data-act="backup">Back up</button></div>`;
 }
 
 /* ---------- main views ---------- */
 const main = () => $('#main');
 function render() {
-  const titles = { timeline: 'Journal', calendar: 'Calendar', media: 'Photos', search: 'Search' };
+  if (S.map) { try { S.map.remove(); } catch (_) { /* already gone */ } S.map = null; }
+  const titles = { timeline: 'Journal', calendar: 'Calendar', media: 'Photos', map: 'Map', search: 'Search' };
   $('#view-title').textContent = S.filter !== 'all' && S.view === 'timeline' ? jname(S.filter) : titles[S.view];
   $$('nav.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.view === S.view));
   const sel = $('#journal-filter');
   sel.innerHTML = `<option value="all">All journals</option>` + S.journals.map((j) => `<option value="${j.id}">${esc(j.name)}</option>`).join('');
   sel.value = S.filter; sel.parentElement.classList.toggle('hidden', S.journals.length < 2);
-  ({ timeline: renderTimeline, calendar: renderCalendar, media: renderMedia, search: renderSearch })[S.view]();
+  ({ timeline: renderTimeline, calendar: renderCalendar, media: renderMedia, map: renderMap, search: renderSearch })[S.view]();
 }
 
 function renderTimeline() {
   const list = live(); let h = backupBanner();
   if (!list.length) {
-    h += `<div class="empty"><h2>Nothing written yet</h2><p>Tap + to start. Entries, photos and everything else stay on this phone and work with no signal.</p></div>`;
+    h += `<div class="empty"><h2>Nothing written yet</h2><p>${TAP} + to start${POINTER ? ' (or press N)' : ''}. Entries, photos and everything else stay on ${HERE} and work with no signal.</p></div>`;
   } else {
     const st = computeStats(list);
     h += `<div class="stats"><div class="card"><b>${st.entries}</b><small>entries</small></div><div class="card"><b>${st.streak}</b><small>day streak</small></div><div class="card"><b>${st.words.toLocaleString()}</b><small>words</small></div></div>`;
@@ -368,7 +384,7 @@ function renderSearchResults() {
     && [...S.search.tags].every((t) => (e.tags || []).includes(t))
     && (!ql || stripMoments(e.text).toLowerCase().includes(ql) || (e.tags || []).some((t) => t.toLowerCase().includes(ql)) || (e.location && (e.location.name || '').toLowerCase().includes(ql))));
   const active = q || S.search.starred || S.search.tags.size;
-  $('#search-res').innerHTML = !active ? `<p class="note">Search words, tags and places. Tap a tag to filter.</p>`
+  $('#search-res').innerHTML = !active ? `<p class="note">Search words, tags and places. ${TAP} a tag to filter.</p>`
     : `<p class="note">${res.length} result${res.length === 1 ? '' : 's'}</p>` + res.slice(0, 200).map((e) => entryCard(e, q)).join('');
   hydrate($('#search-res'));
 }
@@ -415,7 +431,7 @@ function renderReader(el) {
       <div class="ttl">${esc(d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }))}<small>${esc(fmtTime(d))}</small></div>
       <button class="txtbtn r" data-a="edit">Edit</button></header>
     <div class="scroll reader">
-      <div class="md">${toBlocks(e).map((b) => b.t === 'photo' ? `<img class="inl" data-photo="${b.id}" alt="">` : (b.v.trim() ? md(b.v) : '')).join('') || '<p style="color:var(--muted)">No text.</p>'}</div>
+      <div class="md">${toBlocks(e).map((b) => { if (b.t !== 'photo') return b.v.trim() ? md(b.v) : ''; const m = (e.photoMeta || {})[b.id]; return `<figure class="rf"><img class="inl" data-photo="${b.id}" alt="">${m && m.lat != null ? `<figcaption>${ic('pin')}${esc(m.name || `${m.lat.toFixed(4)}, ${m.lon.toFixed(4)}`)}</figcaption>` : ''}</figure>`; }).join('') || '<p style="color:var(--muted)">No text.</p>'}</div>
       <div class="card facts">${facts}</div>
       <div class="row" style="justify-content:space-between;margin-top:14px">
         <button class="btn ghost" data-a="star">${e.starred ? 'Unstar' : 'Star'}</button>
@@ -463,7 +479,7 @@ function openEditor(existing, onDate) {
 
   const el = sheet(`<header>
       <button class="txtbtn l" data-a="discard">${isNew ? 'Discard' : ''}</button>
-      <div class="ttl" style="position:relative"><span id="ed-when"></span><small>Tap to change date</small>
+      <div class="ttl" style="position:relative"><span id="ed-when"></span><small>${TAP} to change date</small>
         <input type="datetime-local" id="ed-date" style="position:absolute;inset:0;opacity:0;width:100%" aria-label="Entry date"></div>
       <button class="txtbtn r" data-a="done">Done</button></header>
     <div class="scroll"><div class="ed-meta" id="ed-meta"></div><div id="ed-body"></div></div>
@@ -478,7 +494,11 @@ function openEditor(existing, onDate) {
     </div>`);
   const pop = $('#ed-pop', el), body = $('#ed-body', el);
   let blocks = toBlocks(e), lastTA = null;
-  const sync = () => { const r = fromBlocks(blocks); e.text = r.text; e.photos = r.photos; };
+  const sync = () => {
+    const r = fromBlocks(blocks); e.text = r.text; e.photos = r.photos;
+    if (e.photoMeta) for (const k of Object.keys(e.photoMeta)) if (!e.photos.includes(k)) delete e.photoMeta[k];
+  };
+  const phLabel = (id) => { const m = (e.photoMeta || {})[id]; return m && m.lat != null ? esc(m.name || 'Placed') : 'Add place'; };
   const growTA = (ta) => {
     const i = +ta.dataset.i; ta.style.height = 'auto';
     const min = blocks.length === 1 ? window.innerHeight * 0.45 : i === blocks.length - 1 ? 140 : 34;
@@ -486,7 +506,7 @@ function openEditor(existing, onDate) {
   };
   const paintBody = (focusIdx, caret) => {
     body.innerHTML = blocks.map((b, i) => b.t === 'photo'
-      ? `<div class="ph-inl"><img data-photo="${b.id}" alt=""><button class="x" data-rm="${b.id}" aria-label="Remove photo">×</button></div>`
+      ? `<div class="ph-inl"><img data-photo="${b.id}" alt=""><button class="pl ${(e.photoMeta || {})[b.id] && e.photoMeta[b.id].lat != null ? 'on' : ''}" data-phloc="${b.id}" aria-label="Photo location">${ic('pin')}<span>${phLabel(b.id)}</span></button><button class="x" data-rm="${b.id}" aria-label="Remove photo">×</button></div>`
       : `<textarea class="ed-text" data-i="${i}" rows="1" placeholder="${i === 0 ? "What's on your mind?" : i === blocks.length - 1 ? 'Keep writing…' : 'Add text'}"></textarea>`).join('');
     $$('textarea', body).forEach((ta) => { ta.value = blocks[+ta.dataset.i].v; growTA(ta); });
     hydrate(body);
@@ -529,20 +549,48 @@ function openEditor(existing, onDate) {
     $('[data-a=star]', el).classList.toggle('on', e.starred);
   };
   paintWhen(); paintMeta(); paintBody();
-  if (isNew) setTimeout(() => { const t0 = $('textarea', body); if (t0) { t0.focus(); lastTA = t0; } }, 250);
+  if (isNew) { const f0 = () => { const t0 = $('textarea', body); if (t0) { t0.focus(); lastTA = t0; } }; if (POINTER) f0(); else setTimeout(f0, 250); }
 
-  $('#ed-file', el).addEventListener('change', async (ev) => {
-    const files = [...ev.target.files]; ev.target.value = '';
+  $('#ed-file', el).addEventListener('change', (ev) => { const files = [...ev.target.files]; ev.target.value = ''; addFiles(files); });
+  // on a Mac: drag photos from Finder or Photos onto the entry, or paste one
+  el.addEventListener('dragover', (ev) => { if ([...ev.dataTransfer.types].includes('Files')) { ev.preventDefault(); el.classList.add('drop'); } });
+  el.addEventListener('dragleave', (ev) => { if (ev.target === el || !el.contains(ev.relatedTarget)) el.classList.remove('drop'); });
+  el.addEventListener('drop', (ev) => {
+    el.classList.remove('drop'); const files = [...ev.dataTransfer.files].filter((f) => /^image\//.test(f.type) || /\.(jpe?g|png|heic|heif|gif|webp)$/i.test(f.name));
+    if (!ev.dataTransfer.files.length) return; ev.preventDefault();
+    const ta = ev.target.closest && ev.target.closest('textarea'); if (ta) lastTA = ta;
+    if (files.length) addFiles(files); else toast('Only photos can be added');
+  });
+  el.addEventListener('paste', (ev) => {
+    const files = [...(ev.clipboardData && ev.clipboardData.files || [])].filter((f) => /^image\//.test(f.type));
+    if (files.length) { ev.preventDefault(); addFiles(files); }
+  });
+  el._done = () => $('[data-a=done]', el).click();
+  async function addFiles(files) {
     if (!files.length) return;
     toast(`Adding ${files.length} photo${files.length > 1 ? 's' : ''}…`);
-    const ids = [];
+    const ids = [], here = [];
+    e.photoMeta = e.photoMeta || {};
     for (const f of files) {
-      try { const p = await makePhoto(f); await DB.put('photos', p); ids.push(p.id); }
-      catch (err) { toast(err.message); }
+      try {
+        const { rec, exif } = await makePhoto(f); await DB.put('photos', rec); ids.push(rec.id);
+        const m = { taken: exif.taken || null };
+        if (exif.lat != null) Object.assign(m, { lat: exif.lat, lon: exif.lon, src: 'photo', name: nearestPlaceName(exif.lat, exif.lon) || '' });
+        else if (S.autoTag) { const t = m.taken ? new Date(m.taken).getTime() : f.lastModified; if (t && Math.abs(Date.now() - t) < 30 * 60000) here.push(rec.id); }
+        e.photoMeta[rec.id] = m;
+      } catch (err) { toast(err.message); }
     }
     if (!ids.length) return;
     insertPhotos(ids); dirty = true; await persist();
-  });
+    if (here.length) {
+      // a photo taken just now has no GPS in it (iPhone strips it), so tag it with where the phone is
+      try {
+        const pos = await getPosition(), name = nearestPlaceName(pos.lat, pos.lon) || '';
+        for (const id of here) if (e.photoMeta[id]) Object.assign(e.photoMeta[id], { lat: pos.lat, lon: pos.lon, src: 'device', name });
+        repaintPhotoTags(); dirty = true; await persist();
+      } catch (_) { /* no location: the photo simply stays unplaced */ }
+    }
+  }
 
   const showPop = (html) => { pop.innerHTML = html ? `<div class="pop">${html}</div>` : ''; };
   const tagPop = () => {
@@ -564,15 +612,20 @@ function openEditor(existing, onDate) {
       <p class="note" style="margin:8px 0 0">${e.location.lat.toFixed(5)}, ${e.location.lon.toFixed(5)} · Place names you type are reused automatically next time you're nearby.</p>
       <button class="btn danger" data-a="loc-rm" style="margin-top:4px;padding-left:0">Remove location</button>`);
   };
-  const nearestName = (lat, lon) => {
-    let best = null, bd = 250; // meters
-    for (const x of S.entries) {
-      if (!x.location || !x.location.name) continue;
-      const dy = (x.location.lat - lat) * 111320, dx = (x.location.lon - lon) * 111320 * Math.cos(lat * Math.PI / 180);
-      const dist = Math.hypot(dx, dy); if (dist < bd) { bd = dist; best = x.location.name; }
-    }
-    return best;
+  const nearestName = nearestPlaceName;
+  let curPh = null;
+  const repaintPhotoTags = () => $$('[data-phloc]', body).forEach((btn) => {
+    const m = (e.photoMeta || {})[btn.dataset.phloc]; btn.classList.toggle('on', !!(m && m.lat != null)); $('span', btn).innerHTML = phLabel(btn.dataset.phloc);
+  });
+  const phLocPop = (id) => {
+    curPh = id; const m = (e.photoMeta || {})[id] || {};
+    const src = m.src === 'photo' ? ' · from the photo' : m.src === 'device' ? ' · where you were when you added it' : '';
+    showPop(`<h4>Photo location</h4>${m.lat != null
+      ? `<div class="row"><input type="text" id="phloc-name" placeholder="Name this place" value="${esc(m.name || '')}"><button class="btn" data-a="phloc-save">Save</button></div><p class="note" style="margin:8px 0">${m.lat.toFixed(5)}, ${m.lon.toFixed(5)}${src}</p>`
+      : '<p class="note" style="margin:0 0 8px">This photo has no location yet.</p>'}
+      <div class="chips"><button class="chip" data-a="phloc-here">${ic('pin')} Where I am now</button>${e.location ? '<button class="chip" data-a="phloc-entry">Same as the entry</button>' : ''}${m.lat != null ? '<button class="chip" data-a="phloc-rm">Remove</button>' : ''}</div>`);
   };
+  const setPhLoc = (m) => { e.photoMeta = e.photoMeta || {}; e.photoMeta[curPh] = { ...(e.photoMeta[curPh] || {}), ...m }; repaintPhotoTags(); changed(); };
 
   el.addEventListener('click', async (ev) => {
     const rm = ev.target.closest('[data-rm]');
@@ -580,6 +633,7 @@ function openEditor(existing, onDate) {
       if (!confirm('Remove this photo from the entry?')) return;
       removePhoto(rm.dataset.rm); await deletePhotos([rm.dataset.rm]); dirty = true; await persist(); return;
     }
+    const pl = ev.target.closest('[data-phloc]'); if (pl) { pop.dataset.open = 'phloc'; phLocPop(pl.dataset.phloc); return; }
     const ph = ev.target.closest('img[data-photo]'); if (ph) return viewPhoto(ph.dataset.photo);
     const ut = ev.target.closest('[data-untag]'); if (ut) { e.tags = e.tags.filter((t) => t !== ut.dataset.untag); paintMeta(); changed(); tagPop(); return; }
     const at = ev.target.closest('[data-addtag]'); if (at) { addTag(at.dataset.addtag); return; }
@@ -591,7 +645,7 @@ function openEditor(existing, onDate) {
       case 'done':
         await autosave.flush();
         if (persisted && !hasContent()) {
-          if (isNew) await hardDelete(e);
+          if (isNew) await hardDelete(e, false);
           else { e.deleted = new Date().toISOString(); await saveEntry(e); const r0 = $('.sheet[data-reader]'); if (r0) r0.remove(); toast('Empty entry moved to Recently Deleted'); }
         }
         el.remove(); render(); const rd = $('.sheet[data-reader]'); if (rd) renderReader(rd);
@@ -599,7 +653,7 @@ function openEditor(existing, onDate) {
       case 'discard':
         if (hasContent() && !confirm('Discard this entry?')) return;
         autosave.cancel(); dirty = false; await deletePhotos(e.photos);
-        if (persisted) await hardDelete(e);
+        if (persisted) await hardDelete(e, false);
         el.remove(); render(); break;
       case 'star': e.starred = !e.starred; paintMeta(); changed(); break;
       case 'mood':
@@ -623,6 +677,15 @@ function openEditor(existing, onDate) {
         break;
       case 'loc-ok': e.location.name = $('#loc-name', el).value.trim(); paintMeta(); changed(); showPop(''); break;
       case 'loc-rm': e.location = null; paintMeta(); changed(); showPop(''); break;
+      case 'phloc-save': setPhLoc({ name: $('#phloc-name', el).value.trim() }); showPop(''); break;
+      case 'phloc-rm': setPhLoc({ lat: null, lon: null, name: '', src: null }); showPop(''); break;
+      case 'phloc-entry': setPhLoc({ lat: e.location.lat, lon: e.location.lon, name: e.location.name || '', src: 'entry' }); showPop(''); break;
+      case 'phloc-here': {
+        toast('Finding your location…', 8000);
+        try { const p = await getPosition(); setPhLoc({ lat: p.lat, lon: p.lon, name: nearestPlaceName(p.lat, p.lon) || '', src: 'device' }); toast('Photo placed'); phLocPop(curPh); }
+        catch (err) { toast(err.message); }
+        break;
+      }
       case 'prompt': {
         if (pop.dataset.open === 'prompt') { pop.dataset.open = ''; showPop(''); break; }
         pop.dataset.open = 'prompt';
@@ -642,19 +705,367 @@ function openEditor(existing, onDate) {
   }
 }
 
+/* ---------- places: photo geotags, map, route sketch ---------- */
+const ML = {
+  js: 'https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.js',
+  jsSri: 'sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp',
+  css: 'https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css',
+  cssSri: 'sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK',
+  style: 'https://tiles.openfreemap.org/styles/liberty',
+};
+
+/* Reads GPS position and capture time from a JPEG's EXIF block. Returns {} when there is none. */
+function readExif(buf) {
+  try {
+    const dv = new DataView(buf);
+    if (dv.getUint16(0) !== 0xFFD8) return {};
+    let off = 2;
+    while (off + 10 < dv.byteLength) {
+      const marker = dv.getUint16(off), len = dv.getUint16(off + 2);
+      if (marker === 0xFFE1 && dv.getUint32(off + 4) === 0x45786966) return parseTiff(dv, off + 10);
+      if ((marker & 0xFF00) !== 0xFF00 || marker === 0xFFDA) break;
+      off += 2 + len;
+    }
+  } catch (_) { /* malformed EXIF: treat as none */ }
+  return {};
+}
+function parseTiff(dv, t) {
+  const le = dv.getUint16(t) === 0x4949;
+  const u16 = (o) => dv.getUint16(t + o, le), u32 = (o) => dv.getUint32(t + o, le);
+  const ifd = (o) => { const n = u16(o), tags = {}; for (let i = 0; i < n; i++) { const e = o + 2 + i * 12; tags[u16(e)] = { count: u32(e + 4), at: e + 8 }; } return tags; };
+  const rat = (o) => u32(o) / (u32(o + 4) || 1);
+  const str = (tag) => { const o = tag.count > 4 ? u32(tag.at) : tag.at; let s = ''; for (let i = 0; i < tag.count - 1; i++) s += String.fromCharCode(dv.getUint8(t + o + i)); return s; };
+  const when = (tag) => { const m = tag && str(tag).match(/(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)/); return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).toISOString() : null; };
+  const out = {}, ifd0 = ifd(u32(4));
+  if (ifd0[0x8769]) { const ex = ifd(u32(ifd0[0x8769].at)); out.taken = when(ex[0x9003] || ex[0x9004]); }
+  if (!out.taken) out.taken = when(ifd0[0x0132]);
+  if (ifd0[0x8825]) {
+    const g = ifd(u32(ifd0[0x8825].at));
+    const deg = (tag) => { if (!tag) return null; const o = u32(tag.at); return rat(o) + rat(o + 8) / 60 + rat(o + 16) / 3600; };
+    const ref = (tag, d) => (tag ? String.fromCharCode(dv.getUint8(t + tag.at)) : d);
+    const la = deg(g[2]), lo = deg(g[4]);
+    if (la != null && lo != null && !(la === 0 && lo === 0)) { out.lat = ref(g[1], 'N') === 'S' ? -la : la; out.lon = ref(g[3], 'E') === 'W' ? -lo : lo; }
+  }
+  return out;
+}
+
+function getPosition() {
+  return new Promise((res, rej) => {
+    if (!navigator.geolocation) return rej(new Error('Location is not available on this device'));
+    navigator.geolocation.getCurrentPosition((p) => res({ lat: p.coords.latitude, lon: p.coords.longitude }),
+      (err) => rej(new Error(err.code === 1 ? 'Location permission is off for Daybook' : 'Could not get a location fix')),
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 60000 });
+  });
+}
+function nearestPlaceName(lat, lon) {
+  let best = null, bd = 250; // meters
+  const test = (p) => {
+    if (!p || p.lat == null || !p.name) return;
+    const dy = (p.lat - lat) * 111320, dx = (p.lon - lon) * 111320 * Math.cos(lat * Math.PI / 180);
+    const dist = Math.hypot(dx, dy); if (dist < bd) { bd = dist; best = p.name; }
+  };
+  for (const x of S.entries) { test(x.location); for (const m of Object.values(x.photoMeta || {})) test(m); }
+  return best;
+}
+const milesBetween = (a, b) => {
+  const r = Math.PI / 180, h = Math.sin((b.lat - a.lat) * r / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin((b.lon - a.lon) * r / 2) ** 2;
+  return 3958.8 * 2 * Math.asin(Math.sqrt(h));
+};
+function captionAfter(blocks, i) {
+  const next = blocks[i + 1];
+  const t = next && next.t === 'text' ? plain(next.v).replace(/\s+/g, ' ').trim() : '';
+  if (!t) return '';
+  const first = (t.match(/^.*?[.!?](\s|$)/) || [t])[0].trim();
+  return first.length > 140 ? first.slice(0, 137) + '…' : first;
+}
+/* Every place in these entries, oldest first: photos with their own position, then each entry's own location. */
+function mapPoints(list) {
+  const pts = [];
+  for (const e of list) {
+    const blocks = toBlocks(e), title = titleSnip(e.text).title || 'Entry', meta = e.photoMeta || {};
+    let loose = null;
+    blocks.forEach((b, i) => {
+      if (b.t !== 'photo') return;
+      const m = meta[b.id];
+      if (!m || m.lat == null) { if (!loose) loose = b.id; return; }
+      pts.push({ kind: 'photo', entry: e.id, anchor: 'p-' + b.id, lat: m.lat, lon: m.lon, t: m.taken || e.created,
+        name: m.name || '', caption: captionAfter(blocks, i) || title, thumbId: b.id });
+    });
+    // skip the entry's own pin when one of its photos already marks the same spot
+    const dup = e.location && pts.some((q) => q.entry === e.id && milesBetween(q, e.location) < 0.03);
+    if (e.location && !dup) pts.push({ kind: 'entry', entry: e.id, anchor: 'e-' + e.id, lat: e.location.lat, lon: e.location.lon,
+      t: e.created, name: e.location.name || '', caption: title, thumbId: loose });
+  }
+  return pts.sort((a, b) => new Date(a.t) - new Date(b.t));
+}
+function routeMiles(pts) { let m = 0; for (let i = 1; i < pts.length; i++) m += milesBetween(pts[i - 1], pts[i]); return m; }
+/* A plain drawing of the route with no base map: works offline and in previews that don't run scripts. */
+function sketchSVG(pts, W = 360, H = 420) {
+  if (!pts.length) return '';
+  const P = 40;
+  const pr = pts.map((p) => ({ ...p, x: (p.lon + 180) / 360, y: (1 - Math.log(Math.tan(Math.PI / 4 + p.lat * Math.PI / 360)) / Math.PI) / 2 }));
+  const xs = pr.map((p) => p.x), ys = pr.map((p) => p.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const s = Math.min((W - 2 * P) / Math.max(x1 - x0, 1e-9), (H - 2 * P) / Math.max(y1 - y0, 1e-9));
+  const X = (x) => W / 2 + (x - (x0 + x1) / 2) * s, Y = (y) => H / 2 + (y - (y0 + y1) / 2) * s;
+  const seen = new Set(), labels = [];
+  const X0 = (x) => W / 2 + (x - (x0 + x1) / 2) * s, Y0 = (y) => H / 2 + (y - (y0 + y1) / 2) * s;
+  pr.forEach((p) => {
+    // one label per place name, and none that would sit on top of another
+    if (!p.name || seen.has(p.name) || labels.length >= 12) return;
+    if (labels.some((q) => Math.abs(X0(q.x) - X0(p.x)) < 70 && Math.abs(Y0(q.y) - Y0(p.y)) < 16)) return;
+    seen.add(p.name); labels.push(p);
+  });
+  const f = (n) => n.toFixed(1);
+  return `<svg viewBox="0 0 ${W} ${H}" class="sk" role="img" aria-label="Route sketch">
+    ${pr.length > 1 ? `<polyline points="${pr.map((p) => `${f(X(p.x))},${f(Y(p.y))}`).join(' ')}" class="sk-route"/>` : ''}
+    ${pr.map((p) => `<circle cx="${f(X(p.x))}" cy="${f(Y(p.y))}" r="${p.kind === 'photo' ? 5 : 6.5}" class="sk-pt ${p.kind}"/>`).join('')}
+    <circle cx="${f(X(pr[0].x))}" cy="${f(Y(pr[0].y))}" r="11" class="sk-start"/>
+    ${labels.map((p) => { const x = X(p.x), right = x > W * 0.68; return `<text x="${f(right ? x - 10 : x + 10)}" y="${f(Y(p.y) + 4)}" text-anchor="${right ? 'end' : 'start'}" class="sk-lbl">${esc(p.name)}</text>`; }).join('')}
+  </svg>`;
+}
+function loadMapLib() {
+  if (window.maplibregl) return Promise.resolve(window.maplibregl);
+  if (loadMapLib.p) return loadMapLib.p;
+  loadMapLib.p = new Promise((res, rej) => {
+    const l = document.createElement('link'); Object.assign(l, { rel: 'stylesheet', href: ML.css, integrity: ML.cssSri, crossOrigin: 'anonymous' });
+    const s = document.createElement('script'); Object.assign(s, { src: ML.js, integrity: ML.jsSri, crossOrigin: 'anonymous' });
+    s.onload = () => res(window.maplibregl);
+    s.onerror = () => { loadMapLib.p = null; rej(new Error('The map needs a connection')); };
+    document.head.append(l, s);
+    setTimeout(() => rej(new Error('The map took too long to load')), 20000);
+  });
+  return loadMapLib.p;
+}
+function popupHTML(p) {
+  const d = new Date(p.t);
+  return `<div class="pp">${p.thumbId ? `<img data-photo="${p.thumbId}" data-thumb alt="">` : ''}<b>${esc(p.caption)}</b>
+    <small>${esc(fmtShort(d))}${p.name ? ' · ' + esc(p.name) : ''}</small><button data-open="${p.entry}">Open entry</button></div>`;
+}
+function buildLiveMap(ml, box, pts) {
+  box.innerHTML = ''; box.classList.add('live');
+  const map = new ml.Map({ container: box, style: ML.style, attributionControl: { compact: true } });
+  map.addControl(new ml.NavigationControl({ showCompass: false }), 'top-right');
+  const b = new ml.LngLatBounds(); pts.forEach((p) => b.extend([p.lon, p.lat]));
+  map.fitBounds(b, { padding: 56, maxZoom: 14, duration: 0 });
+  map.on('load', () => {
+    if (pts.length < 2) return;
+    map.addSource('route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: pts.map((p) => [p.lon, p.lat]) } } });
+    map.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#c8923c', 'line-width': 3.5, 'line-dasharray': [2, 1.6] } });
+  });
+  for (const p of pts) {
+    const el = document.createElement('div'); el.className = 'mk ' + (p.thumbId ? 'mk-ph' : 'mk-en');
+    if (p.thumbId) { const img = document.createElement('img'); img.alt = ''; photoURL(p.thumbId, true).then((u) => { img.src = u; }); el.appendChild(img); }
+    const pop = new ml.Popup({ offset: 24, maxWidth: '240px' }).setHTML(popupHTML(p));
+    pop.on('open', () => hydrate(pop.getElement()));
+    new ml.Marker({ element: el }).setLngLat([p.lon, p.lat]).setPopup(pop).addTo(map);
+  }
+  return map;
+}
+function renderMap() {
+  const all = live();
+  const tags = [...new Set(all.flatMap((e) => e.tags || []))].sort();
+  if (S.mapTag && !tags.includes(S.mapTag)) S.mapTag = '';
+  const list = S.mapTag ? all.filter((e) => (e.tags || []).includes(S.mapTag)) : all;
+  const pts = mapPoints(list);
+  const first = pts.length ? new Date(pts[0].t) : null, last = pts.length ? new Date(pts[pts.length - 1].t) : null;
+  const miles = routeMiles(pts);
+  main().innerHTML = `<div class="row" style="margin:8px 0 10px">
+      ${tags.length ? `<select id="map-tag" class="field" aria-label="Show a tag"><option value="">Everything</option>${tags.map((t) => `<option value="${esc(t)}" ${t === S.mapTag ? 'selected' : ''}>#${esc(t)}</option>`).join('')}</select>` : '<span style="flex:1"></span>'}
+      <button class="btn" data-act="share">${ic('share')} Share</button></div>
+    ${pts.length ? `<div class="card mapbox" id="mapbox"><div class="sketch">${sketchSVG(pts)}</div></div>
+      <p class="note" id="map-note">${pts.length} place${pts.length === 1 ? '' : 's'}${pts.length > 1 ? `, about ${Math.round(miles).toLocaleString()} miles of route` : ''} · ${esc(fmtShort(first))}${last - first > 864e5 ? ' to ' + esc(fmtShort(last)) : ''}</p>`
+    : `<div class="empty"><h2>No places yet</h2><p>${TAP} <b>Place</b> in an entry, or add photos you take on the spot. They'll show up here, joined by your route.</p></div>`}`;
+  const sel = $('#map-tag'); if (sel) sel.onchange = () => { S.mapTag = sel.value; render(); };
+  if (!pts.length) return;
+  if (navigator.onLine === false) { $('#map-note').insertAdjacentHTML('beforeend', '<br>Showing a sketch of the route; the full map needs a connection.'); return; }
+  const box = $('#mapbox');
+  loadMapLib().then((ml) => { if (box.isConnected) S.map = buildLiveMap(ml, box, pts); })
+    .catch((err) => { if (box.isConnected) $('#map-note').insertAdjacentHTML('beforeend', `<br>Showing a sketch of the route. ${esc(err.message)}.`); });
+}
+
+/* ---------- share a trip as one self-contained web page ---------- */
+function shareSelection(o) {
+  return S.entries.filter((e) => !e.deleted && (o.journal === 'all' || e.journal === o.journal)
+    && (!o.tag || (e.tags || []).includes(o.tag))
+    && (!o.from || dayKey(new Date(e.created)) >= o.from) && (!o.to || dayKey(new Date(e.created)) <= o.to))
+    .sort((a, b) => new Date(a.created) - new Date(b.created));
+}
+function openShare() {
+  const all = S.entries.filter((e) => !e.deleted);
+  const tags = [...new Set(all.flatMap((e) => e.tags || []))].sort();
+  const el = sheet(`<header><button class="txtbtn l" data-a="x">Cancel</button><div class="ttl">Share a trip</div><span style="min-width:64px"></span></header>
+    <div class="scroll"><div class="card form">
+      <label>Title<input class="field" id="sh-title" type="text"></label>
+      <label>Journal<select class="field" id="sh-j"><option value="all">All journals</option>${S.journals.map((j) => `<option value="${j.id}">${esc(j.name)}</option>`).join('')}</select></label>
+      ${tags.length ? `<label>Tag<select class="field" id="sh-tag"><option value="">Any</option>${tags.map((t) => `<option value="${esc(t)}">#${esc(t)}</option>`).join('')}</select></label>` : ''}
+      <div class="row"><label style="flex:1">From<input class="field" type="date" id="sh-from"></label><label style="flex:1">To<input class="field" type="date" id="sh-to"></label></div>
+      <label>Photo size<select class="field" id="sh-px"><option value="1280">Standard</option><option value="900">Smaller file</option></select></label>
+      <label class="chk"><input type="checkbox" id="sh-map" checked> Include the map</label>
+      <label class="chk"><input type="checkbox" id="sh-places" checked> Include place names</label>
+    </div>
+    <p class="note" id="sh-sum"></p>
+    <button class="btn" style="width:100%;margin-top:6px" data-a="go">Create the page</button>
+    <p class="note">This makes one web page file that opens in any browser, on any phone or computer. Moods, tags and stars stay out of it. Unlike your journal, the page leaves ${HERE} with whoever you send it to.</p></div>`);
+  const $s = (id) => $('#' + id, el);
+  if (S.filter !== 'all') $s('sh-j').value = S.filter;
+  if ($s('sh-tag') && S.view === 'map' && S.mapTag) $s('sh-tag').value = S.mapTag;
+  const opts = () => ({ journal: $s('sh-j').value, tag: $s('sh-tag') ? $s('sh-tag').value : '', from: $s('sh-from').value, to: $s('sh-to').value,
+    px: +$s('sh-px').value, map: $s('sh-map').checked, places: $s('sh-places').checked, title: $s('sh-title').value.trim() });
+  let titleEdited = false;
+  const resetScope = () => {
+    const o = opts(); o.from = ''; o.to = '';
+    const list = shareSelection(o);
+    $s('sh-from').value = list.length ? dayKey(new Date(list[0].created)) : '';
+    $s('sh-to').value = list.length ? dayKey(new Date(list[list.length - 1].created)) : '';
+    if (!titleEdited) $s('sh-title').value = o.tag ? o.tag.replace(/-/g, ' ').replace(/^./, (c) => c.toUpperCase()) : o.journal !== 'all' ? jname(o.journal) : 'My trip';
+  };
+  const summary = () => {
+    const o = opts(), list = shareSelection(o), photos = list.reduce((n, e) => n + (e.photos || []).length, 0);
+    const mb = photos * (o.px >= 1280 ? 0.33 : 0.17) + 0.05;
+    $s('sh-sum').textContent = list.length ? `${list.length} entr${list.length === 1 ? 'y' : 'ies'}, ${photos} photo${photos === 1 ? '' : 's'}, roughly ${mb < 1 ? '1' : Math.round(mb)} MB.` : 'No entries match.';
+  };
+  resetScope(); summary();
+  el.addEventListener('input', (ev) => { if (ev.target.id === 'sh-title') titleEdited = true; });
+  el.addEventListener('change', (ev) => { if (['sh-j', 'sh-tag'].includes(ev.target.id)) resetScope(); summary(); });
+  el.addEventListener('click', async (ev) => {
+    const a = ev.target.closest('[data-a]'); if (!a) return;
+    if (a.dataset.a === 'x') el.remove();
+    if (a.dataset.a === 'go') {
+      const o = opts(); if (!shareSelection(o).length) { toast('No entries match'); return; }
+      a.disabled = true;
+      try {
+        const { blob, entries, photos } = await buildSharePage(o);
+        const name = (o.title || 'Daybook trip').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, '-') + '.html';
+        toast('Page ready', 1200); el.remove();
+        offerFile(blob, name, `${entries} entr${entries === 1 ? 'y' : 'ies'}, ${photos} photo${photos === 1 ? '' : 's'}`);
+      } catch (err) { toast('Could not build the page: ' + err.message, 5000); }
+      a.disabled = false;
+    }
+  });
+}
+function bufToDataURL(buf, type) {
+  return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(fr.error); fr.readAsDataURL(new Blob([buf], { type })); });
+}
+async function buildSharePage(o) {
+  const list = shareSelection(o);
+  const total = list.reduce((n, e) => n + (e.photos || []).length, 0);
+  let done = 0;
+  const shrink = async (rec, max) => {
+    try { const { im, u } = await loadImg(new Blob([rec.data], { type: rec.type })); try { return bufToDataURL((await scaleTo(im, max, 0.8)).buf, 'image/jpeg'); } finally { URL.revokeObjectURL(u); } }
+    catch (_) { return bufToDataURL(rec.data, rec.type); }
+  };
+  const articles = [];
+  for (const e of list) {
+    const d = new Date(e.created), meta = e.photoMeta || {};
+    let body = '';
+    for (const b of toBlocks(e)) {
+      if (b.t === 'text') { if (b.v.trim()) body += md(b.v); continue; }
+      const rec = await DB.get('photos', b.id); if (!rec) continue;
+      toast(`Preparing photo ${++done} of ${total}…`, 60000);
+      const m = meta[b.id];
+      body += `<figure id="p-${b.id}"><img src="${await shrink(rec, o.px)}" alt="">${o.places && m && m.lat != null && m.name ? `<figcaption>${esc(m.name)}</figcaption>` : ''}</figure>`;
+    }
+    const place = o.places && e.location && e.location.name ? ` · ${esc(e.location.name)}` : '';
+    articles.push(`<article id="e-${e.id}"><h2>${esc(fmtLong(d))}</h2><p class="when">${esc(fmtTime(d))}${place}</p>${body}</article>`);
+  }
+  const pts = o.map ? mapPoints(list) : [];
+  const mapData = [];
+  for (const p of pts) {
+    let th = '';
+    if (p.thumbId) { const rec = await DB.get('photos', p.thumbId); if (rec) th = rec.thumb ? await bufToDataURL(rec.thumb, 'image/jpeg') : await shrink(rec, 360); }
+    mapData.push({ lat: +p.lat.toFixed(5), lon: +p.lon.toFixed(5), c: p.caption, n: o.places ? p.name : '', d: fmtShort(new Date(p.t)), a: p.anchor, th });
+  }
+  const sk = o.places ? pts : pts.map((p) => ({ ...p, name: '' }));
+  const first = new Date(list[0].created), last = new Date(list[list.length - 1].created);
+  const range = dayKey(first) === dayKey(last) ? fmtLong(first) : `${fmtShort(first)} to ${fmtShort(last)}`;
+  const miles = routeMiles(pts);
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(o.title || 'Trip')}</title>
+<style>
+:root{--bg:#f7f4ee;--surface:#fff;--text:#1d1f23;--muted:#6b6f78;--line:#e2ddd3;--accent:#1f4468;--gold:#c8923c}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--surface:#1f2227;--text:#eceae6;--muted:#9a9ea6;--line:#33373e;--accent:#8fb6de;--gold:#d9a553}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:18px/1.6 "New York","Iowan Old Style",Georgia,serif}
+.wrap{max-width:720px;margin:0 auto;padding:28px 16px 60px}
+h1{font-size:34px;line-height:1.15;margin:0 0 6px}.sub{color:var(--muted);font:15px -apple-system,Helvetica,Arial,sans-serif;margin:0 0 20px}
+.mapbox{height:60vh;min-height:300px;border-radius:14px;overflow:hidden;background:var(--surface);border:1px solid var(--line);position:relative}
+.sketch{height:100%;display:flex;align-items:center;justify-content:center;background-image:radial-gradient(var(--line) 1px,transparent 1px);background-size:18px 18px}
+.sk{width:100%;height:100%}.sk-route{fill:none;stroke:var(--gold);stroke-width:3;stroke-dasharray:7 6;stroke-linecap:round;stroke-linejoin:round}
+.sk-pt.entry{fill:var(--accent);stroke:var(--surface);stroke-width:2}.sk-pt.photo{fill:var(--gold);stroke:var(--surface);stroke-width:2}.sk-start{fill:none;stroke:var(--accent);stroke-width:2}
+.sk-lbl{font:13px -apple-system,Helvetica,Arial,sans-serif;fill:var(--text);paint-order:stroke;stroke:var(--surface);stroke-width:3px}
+.mapnote{color:var(--muted);font:13px -apple-system,Helvetica,Arial,sans-serif;margin:8px 2px 28px}
+article{border-top:1px solid var(--line);padding-top:22px;margin-top:26px}h2{font-size:22px;margin:0}
+.when{color:var(--muted);font:14px -apple-system,Helvetica,Arial,sans-serif;margin:2px 0 14px}
+article h1{font-size:24px;margin:14px 0 6px}article h3{font-size:19px}
+figure{margin:14px 0 18px}figure img{width:100%;border-radius:12px;display:block}
+figcaption{color:var(--muted);font:13px -apple-system,Helvetica,Arial,sans-serif;margin-top:6px}
+blockquote{margin:0 0 12px;padding-left:12px;border-left:3px solid var(--gold);color:var(--muted)}a{color:var(--accent)}
+footer{color:var(--muted);font:13px -apple-system,Helvetica,Arial,sans-serif;margin-top:40px;text-align:center}
+.mk{cursor:pointer}.mk-ph{width:46px;height:46px;border-radius:50%;border:3px solid #fff;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.35);background:#ddd}
+.mk-ph img{width:100%;height:100%;object-fit:cover;display:block}.mk-en{width:18px;height:18px;border-radius:50%;background:#1f4468;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35)}
+.pp{font:14px -apple-system,Helvetica,Arial,sans-serif;color:#1d1f23}.pp img{width:100%;border-radius:8px;display:block;margin-bottom:6px}.pp b{display:block}.pp small{color:#6b6f78;display:block;margin:2px 0 6px}.pp a{color:#1f4468;font-weight:600}
+</style></head><body><div class="wrap">
+<h1>${esc(o.title || 'Trip')}</h1>
+<p class="sub">${esc(range)} · ${list.length} entr${list.length === 1 ? 'y' : 'ies'}${total ? `, ${total} photo${total === 1 ? '' : 's'}` : ''}</p>
+${pts.length ? `<div class="mapbox" id="map"><div class="sketch">${sketchSVG(sk)}</div></div>
+<p class="mapnote">${pts.length > 1 ? `About ${Math.round(miles).toLocaleString()} miles of route. ` : ''}<span id="mapmsg">Opened in a web browser with a connection, this becomes a zoomable map; tap a photo on it to jump to that part of the trip.</span></p>` : ''}
+${articles.join('\n')}
+<footer>Made with Daybook</footer></div>
+${pts.length ? `<script>
+(function(){
+  var P=${JSON.stringify(mapData).replace(/</g, '\\u003c')};
+  var box=document.getElementById('map'), msg=document.getElementById('mapmsg');
+  function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function build(ml){
+    box.innerHTML='';
+    var map=new ml.Map({container:box,style:${JSON.stringify(ML.style)},attributionControl:{compact:true}});
+    map.addControl(new ml.NavigationControl({showCompass:false}),'top-right');
+    var b=new ml.LngLatBounds(); P.forEach(function(p){b.extend([p.lon,p.lat]);});
+    map.fitBounds(b,{padding:56,maxZoom:14,duration:0});
+    map.on('load',function(){ if(P.length<2) return;
+      map.addSource('route',{type:'geojson',data:{type:'Feature',geometry:{type:'LineString',coordinates:P.map(function(p){return [p.lon,p.lat];})}}});
+      map.addLayer({id:'route',type:'line',source:'route',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#c8923c','line-width':3.5,'line-dasharray':[2,1.6]}}); });
+    P.forEach(function(p){
+      var el=document.createElement('div'); el.className='mk '+(p.th?'mk-ph':'mk-en');
+      if(p.th){var im=document.createElement('img'); im.src=p.th; im.alt=''; el.appendChild(im);}
+      var html='<div class="pp">'+(p.th?'<img src="'+p.th+'" alt="">':'')+'<b>'+esc(p.c)+'</b><small>'+esc(p.d)+(p.n?' · '+esc(p.n):'')+'</small><a href="#'+p.a+'">Read this part</a></div>';
+      new ml.Marker({element:el}).setLngLat([p.lon,p.lat]).setPopup(new ml.Popup({offset:24,maxWidth:'240px'}).setHTML(html)).addTo(map);
+    });
+    msg.textContent='Tap a marker to see the photo and jump to that part of the trip. Map data from OpenFreeMap and OpenStreetMap.';
+  }
+  if(navigator.onLine===false) return;
+  var l=document.createElement('link'); l.rel='stylesheet'; l.href=${JSON.stringify(ML.css)}; l.integrity=${JSON.stringify(ML.cssSri)}; l.crossOrigin='anonymous';
+  var s=document.createElement('script'); s.src=${JSON.stringify(ML.js)}; s.integrity=${JSON.stringify(ML.jsSri)}; s.crossOrigin='anonymous';
+  s.onload=function(){ try{ build(window.maplibregl); }catch(e){} };
+  document.head.appendChild(l); document.head.appendChild(s);
+})();
+</script>` : ''}
+</body></html>`;
+  return { blob: new Blob([html], { type: 'text/html' }), entries: list.length, photos: total };
+}
+
 /* ---------- backup / export / import ---------- */
-async function buildBackup() {
+const changedAt = (e) => new Date(e.modified || e.created).getTime();
+// an entry goes in the next sync file if it changed since the last one was sent, unless the change arrived in a sync file
+const toSend = (e, since) => changedAt(e) > since && (!since || e.rcv !== e.modified);
+async function buildBackup(sync) { // sync: { since } builds a sync file of changes, deletions included
   const zip = new JSZip(); const photosDir = zip.folder('photos');
   const recs = new Map((await DB.all('photos')).map((p) => [p.id, p]));
   const byJ = new Map(); let nPhotos = 0;
-  for (const e of S.entries.filter((x) => !x.deleted).sort((a, b) => new Date(a.created) - new Date(b.created))) {
+  const since = sync && sync.since ? new Date(sync.since).getTime() : 0;
+  const pick = sync ? (x) => toSend(x, since) : (x) => !x.deleted;
+  for (const e of S.entries.filter(pick).sort((a, b) => new Date(a.created) - new Date(b.created))) {
     const photos = [];
     (e.photos || []).forEach((pid, i) => {
       const p = recs.get(pid); if (!p) return;
       const bytes = new Uint8Array(p.data); const h = p.md5 || md5(bytes);
       const ext = (p.type.split('/')[1] || 'jpeg').replace('jpg', 'jpeg');
       photosDir.file(`${h}.${ext}`, bytes, { compression: 'STORE' }); nPhotos++;
-      photos.push({ identifier: pid, md5: h, type: ext, width: p.w, height: p.h, orderInEntry: i });
+      const pm = (e.photoMeta || {})[pid] || {};
+      const po = { identifier: pid, md5: h, type: ext, width: p.w, height: p.h, orderInEntry: i };
+      if (pm.taken) po.date = isoZ(pm.taken);
+      if (pm.lat != null) po.location = { latitude: pm.lat, longitude: pm.lon, placeName: pm.name || '' };
+      photos.push(po);
     });
     let text = e.text;
     const placed = new Set([...String(e.text).matchAll(MOMENT_RE)].map((m) => m[1]));
@@ -662,6 +1073,7 @@ async function buildBackup() {
     if (loose.length) text += (text ? '\n\n' : '') + loose.map((p) => `![](dayone-moment://${p.identifier})`).join('\n\n');
     const o = { uuid: e.id, creationDate: isoZ(e.created), modifiedDate: isoZ(e.modified || e.created), timeZone: e.tz || TZ,
       text, tags: e.tags || [], starred: !!e.starred, daybook: { journal: e.journal, mood: e.mood || null } };
+    if (sync) Object.assign(o.daybook, { modified: e.modified || e.created, deleted: e.deleted || null, photoMeta: e.photoMeta || {} });
     if (e.location) o.location = { latitude: e.location.lat, longitude: e.location.lon, placeName: e.location.name || '' };
     if (e.weather) o.weather = { temperatureCelsius: e.weather.tempC, conditionsDescription: e.weather.desc };
     if (photos.length) o.photos = photos;
@@ -675,8 +1087,15 @@ async function buildBackup() {
       daybook: { journal: S.journals.find((j) => j.id === jid) || { id: jid, name } }, entries }, null, 2), { compression: 'DEFLATE' });
   }
   zip.file('daybook-journals.json', JSON.stringify({ journals: S.journals }), { compression: 'DEFLATE' });
+  let removed = 0;
+  if (sync) {
+    const tombs = (await DB.meta('tombstones', [])).filter((t) => new Date(t.at).getTime() > since);
+    removed = tombs.length;
+    zip.file('daybook-sync.json', JSON.stringify({ app: 'Daybook ' + APP_VERSION, from: DEVICE, sent: new Date().toISOString(),
+      since: sync.since || null, tombstones: tombs }), { compression: 'DEFLATE' });
+  }
   const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/zip' });
-  return { blob, entries: [...byJ.values()].reduce((n, a) => n + a.length, 0), photos: nPhotos };
+  return { blob, entries: [...byJ.values()].reduce((n, a) => n + a.length, 0), photos: nPhotos, removed };
 }
 
 function buildMarkdown() {
@@ -695,16 +1114,16 @@ function buildMarkdown() {
   return new Blob([out], { type: 'text/markdown' });
 }
 
-function offerFile(blob, name, detail, onSaved) {
+function offerFile(blob, name, detail, onSaved, kind) {
   const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
   const canShare = navigator.canShare && navigator.canShare({ files: [file] });
   const url = URL.createObjectURL(blob);
   const el = sheet(`<header><button class="txtbtn l" data-a="x">Close</button><div class="ttl">Ready to save</div><span style="min-width:64px"></span></header>
     <div class="scroll"><div class="card" style="padding:16px">
       <p style="margin:0 0 4px;font-weight:600">${esc(name)}</p><p class="note" style="margin:0 0 14px">${esc(detail)} · ${fmtBytes(blob.size)}</p>
-      ${canShare ? `<button class="btn" style="width:100%" data-a="share">${ic('share')} Save to Files or share…</button>` : ''}
+      ${canShare ? `<button class="btn" style="width:100%" data-a="share">${ic('share')} ${kind === 'sync' ? 'AirDrop or share…' : IS_MAC ? 'Share…' : 'Save to Files or share…'}</button>` : ''}
       <a class="btn ghost" style="display:block;text-align:center;text-decoration:none;margin-top:10px" href="${url}" download="${esc(name)}" data-a="dl">Download</a>
-      <p class="note" style="margin-top:14px">On iPhone, choose <b>Save to Files</b> and pick iCloud Drive or Google Drive so the copy lives off this phone.</p>
+      ${kind === 'sync' ? `<p class="note" style="margin-top:14px">Send this file to your other device: AirDrop it, or save it to iCloud Drive or Google Drive. There, open Daybook, go to Settings and choose <b>Open a sync file</b>.</p>` : `<p class="note" style="margin-top:14px">${IS_MAC ? 'On a Mac, Download saves to your Downloads folder; move the copy into iCloud Drive or Google Drive so it lives off this Mac.' : 'On iPhone, choose <b>Save to Files</b> and pick iCloud Drive or Google Drive so the copy lives off this phone.'}</p>`}
     </div></div>`);
   el.addEventListener('click', async (ev) => {
     const a = ev.target.closest('[data-a]'); if (!a) return;
@@ -730,26 +1149,44 @@ async function doBackup() {
 }
 
 async function importFile(file) {
-  const jsons = []; let zip = null; let journalsFile = null;
+  const jsons = []; let zip = null; let journalsFile = null, syncInfo = null;
   if (/\.zip$/i.test(file.name) || /zip/.test(file.type)) {
     zip = await JSZip.loadAsync(file);
     for (const [path, f] of Object.entries(zip.files)) {
       if (f.dir || !/\.json$/i.test(path) || path.startsWith('__MACOSX') || /(^|\/)\._/.test(path)) continue;
       const data = JSON.parse(await f.async('string'));
       if (/daybook-journals\.json$/i.test(path)) { journalsFile = data; continue; }
+      if (/daybook-sync\.json$/i.test(path)) { syncInfo = data; continue; }
       jsons.push({ name: path.split('/').pop().replace(/\.json$/i, ''), data });
     }
   } else {
     jsons.push({ name: file.name.replace(/\.json$/i, ''), data: JSON.parse(await file.text()) });
   }
   if (journalsFile && Array.isArray(journalsFile.journals)) {
-    for (const j of journalsFile.journals) if (!S.journals.some((x) => x.id === j.id)) S.journals.push({ id: j.id, name: j.name });
+    for (const j of journalsFile.journals) {
+      const have = S.journals.find((x) => x.id === j.id);
+      if (!have) S.journals.push({ id: j.id, name: j.name });
+      else if (syncInfo && j.name) have.name = j.name; // a rename on the other device carries over
+    }
   }
-  const r = { added: 0, updated: 0, skipped: 0, photos: 0, missing: 0 };
+  // An entry changed here since the last sync, and also changed on the other device, is kept twice rather than lost.
+  const syncedAt = syncInfo ? await DB.meta('syncedAt', null) : null;
+  const r = { added: 0, updated: 0, skipped: 0, photos: 0, missing: 0, deleted: 0, removed: 0, conflicts: 0 };
   const ensureJournal = (name) => {
     let j = S.journals.find((x) => x.name.toLowerCase() === name.toLowerCase());
     if (!j) { j = { id: uuid(), name }; S.journals.push(j); }
     return j.id;
+  };
+  const keepCopy = async (ex) => {
+    const cp = JSON.parse(JSON.stringify(ex)); cp.id = uuid(); cp.photos = []; cp.photoMeta = {}; delete cp.rcv;
+    for (const pid of ex.photos || []) {
+      const rec = await DB.get('photos', pid); if (!rec) continue;
+      const nid = uuid(); await DB.put('photos', { ...rec, id: nid }); cp.photos.push(nid);
+      if (ex.photoMeta && ex.photoMeta[pid]) cp.photoMeta[nid] = ex.photoMeta[pid];
+      cp.text = cp.text.split(`dayone-moment://${pid})`).join(`dayone-moment://${nid})`);
+    }
+    cp.tags = [...new Set([...(cp.tags || []), 'sync-conflict'])];
+    await saveEntry(cp); r.conflicts++;
   };
   for (const { name, data } of jsons) {
     if (!data || !Array.isArray(data.entries)) continue;
@@ -758,20 +1195,37 @@ async function importFile(file) {
     const defaultJ = fileJournal ? fileJournal.id : ensureJournal(name);
     for (const de of data.entries) {
       const id = de.uuid || uuid();
+      const xb = de.daybook || {};
       const created = de.creationDate || new Date().toISOString();
-      const modified = de.modifiedDate || created;
-      const ex = S.entries.find((x) => x.id === id);
-      if (ex && ex.modified && new Date(ex.modified) >= new Date(modified)) { r.skipped++; continue; }
-      const photoIds = [], idMap = new Map();
+      const modified = xb.modified || de.modifiedDate || created;
+      let ex = S.entries.find((x) => x.id === id);
+      const localNewer = ex && ex.modified && new Date(ex.modified) >= new Date(modified);
+      // changed here since the last sync and also on the other device: keep both versions
+      const clash = ex && syncedAt && !ex.deleted && !xb.deleted && new Date(ex.modified) > new Date(syncedAt);
+      let asCopy = false;
+      if (localNewer) { if (!clash) { r.skipped++; continue; } asCopy = true; }
+      if (xb.deleted) { // deleted on the other device: move it to Recently Deleted here too
+        if (!ex) { r.skipped++; continue; }
+        ex.deleted = xb.deleted; ex.modified = modified; if (syncInfo) ex.rcv = modified; await DB.put('entries', ex); r.deleted++; continue;
+      }
+      const photoIds = [], idMap = new Map(), photoMeta = {};
       for (const p of de.photos || []) {
+        const have = p.identifier ? await DB.get('photos', p.identifier) : null;
         const f = zip && p.md5 ? zip.file(new RegExp(`(^|/)photos/${p.md5}\\.[a-z0-9]+$`, 'i'))[0] : null;
-        if (!f) { r.missing++; continue; }
-        const bytes = await f.async('uint8array'); const ext = f.name.split('.').pop().toLowerCase();
-        const type = ext === 'png' ? 'image/png' : ext === 'heic' ? 'image/heic' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
-        const rec = { id: p.identifier || uuid(), type, data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-          w: p.width, h: p.height, md5: p.md5, created };
-        try { const { im, u } = await loadImg(new Blob([bytes], { type })); rec.thumb = (await scaleTo(im, 360, 0.72)).buf; URL.revokeObjectURL(u); } catch (_) { /* thumbnail optional */ }
-        await DB.put('photos', rec); photoIds.push(rec.id); if (p.identifier) idMap.set(p.identifier, rec.id); r.photos++;
+        let rec;
+        if (have && (!f || have.md5 === p.md5)) rec = have; // already here: no need to decode it again
+        else if (f) {
+          const bytes = await f.async('uint8array'); const ext = f.name.split('.').pop().toLowerCase();
+          const type = ext === 'png' ? 'image/png' : ext === 'heic' ? 'image/heic' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+          rec = { id: p.identifier || uuid(), type, data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+            w: p.width, h: p.height, md5: p.md5, created };
+          try { const { im, u } = await loadImg(new Blob([bytes], { type })); rec.thumb = (await scaleTo(im, 360, 0.72)).buf; URL.revokeObjectURL(u); } catch (_) { /* thumbnail optional */ }
+          await DB.put('photos', rec); r.photos++;
+        } else { r.missing++; continue; }
+        photoIds.push(rec.id); if (p.identifier) idMap.set(p.identifier, rec.id);
+        const pl = p.location || {};
+        if (xb.photoMeta && p.identifier && xb.photoMeta[p.identifier]) photoMeta[rec.id] = xb.photoMeta[p.identifier];
+        else if (pl.latitude != null || p.date) photoMeta[rec.id] = { taken: p.date || null, ...(pl.latitude != null ? { lat: pl.latitude, lon: pl.longitude, name: pl.placeName || [pl.localityName, pl.administrativeArea].filter(Boolean).join(', '), src: 'photo' } : {}) };
       }
       const text = String(de.text || '')
         .replace(/\\([\\`*_{}[\]()#+\-.!>|~])/g, '$1')
@@ -780,16 +1234,46 @@ async function importFile(file) {
       const loc = de.location && de.location.latitude != null ? { lat: de.location.latitude, lon: de.location.longitude,
         name: de.location.placeName || [de.location.localityName, de.location.administrativeArea].filter(Boolean).join(', ') } : null;
       const w = de.weather ? { tempC: de.weather.temperatureCelsius ?? null, desc: de.weather.conditionsDescription || '' } : null;
-      const entry = { id, journal: (de.daybook && de.daybook.journal) || defaultJ, created, modified, tz: de.timeZone || TZ, text,
-        tags: Array.isArray(de.tags) ? de.tags : [], mood: (de.daybook && de.daybook.mood) || null, starred: !!de.starred,
-        location: loc, weather: w, photos: photoIds, deleted: null };
+      const differs = ex && (ex.text !== text || (ex.tags || []).join() !== (de.tags || []).join() || (ex.mood || null) !== (xb.mood || null));
+      if (asCopy && !differs) { r.skipped++; continue; }
+      if (clash && differs && !asCopy) await keepCopy(ex);
+      const entry = { id, journal: xb.journal || defaultJ, created, modified, tz: de.timeZone || TZ, text,
+        tags: Array.isArray(de.tags) ? de.tags : [], mood: xb.mood || null, starred: !!de.starred,
+        location: loc, weather: w, photos: photoIds, photoMeta, deleted: null };
+      if (syncInfo) entry.rcv = modified;
+      if (asCopy) { // the version here is newer: file the other device's version beside it
+        await keepCopy(entry); await deletePhotos(photoIds.filter((p) => !(ex.photos || []).includes(p))); r.skipped++; continue;
+      }
       if (ex) { await deletePhotos((ex.photos || []).filter((p) => !photoIds.includes(p))); r.updated++; } else r.added++;
       await DB.put('entries', entry);
       const i = S.entries.findIndex((x) => x.id === id); if (i >= 0) S.entries[i] = entry; else S.entries.push(entry);
     }
   }
+  if (syncInfo && Array.isArray(syncInfo.tombstones)) { // deleted for good on the other device
+    for (const t of syncInfo.tombstones) {
+      const ex = S.entries.find((x) => x.id === t.id);
+      if (ex && changedAt(ex) <= new Date(t.at).getTime()) { await hardDelete(ex, false); r.removed++; }
+    }
+  }
   await DB.setMeta('journals', S.journals);
+  if (syncInfo) { await DB.setMeta('syncedAt', new Date().toISOString()); await DB.setMeta('lastSyncIn', { from: syncInfo.from || 'another device', at: new Date().toISOString() }); }
+  r.sync = !!syncInfo;
   return r;
+}
+
+async function sendSync(everything, after) {
+  const since = everything ? null : await DB.meta('lastSyncSent', null);
+  const started = new Date().toISOString();
+  toast('Building sync file…', 20000);
+  try {
+    const { blob, entries, photos, removed } = await buildBackup({ since });
+    toast('Sync file ready', 1200);
+    const d = new Date();
+    const name = `Daybook-sync-from-${DEVICE}-${dayKey(d)}-${pad(d.getHours())}${pad(d.getMinutes())}.zip`;
+    offerFile(blob, name, `${entries} entr${entries === 1 ? 'y' : 'ies'}, ${photos} photo${photos === 1 ? '' : 's'}${removed ? `, ${removed} permanent deletion${removed === 1 ? '' : 's'}` : ''}${since ? ` changed since ${fmtShort(new Date(since))}, ${fmtTime(new Date(since))}` : ''}`, async () => {
+      await DB.setMeta('lastSyncSent', started); await DB.setMeta('syncedAt', started); after && after();
+    }, 'sync');
+  } catch (err) { toast('Sync file failed: ' + err.message, 5000); }
 }
 
 /* ---------- settings ---------- */
@@ -803,9 +1287,12 @@ async function openSettings() {
     try { est = navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate() : null; } catch (_) {}
     try { persisted = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : null; } catch (_) {}
     const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    const lastSent = await DB.meta('lastSyncSent', null), lastIn = await DB.meta('lastSyncIn', null);
+    const pending = S.entries.filter((e) => toSend(e, lastSent ? new Date(lastSent).getTime() : 0)).length
+      + (lastSent ? (await DB.meta('tombstones', [])).filter((t) => t.at > lastSent).length : 0);
     el.innerHTML = `<header><span style="min-width:64px"></span><div class="ttl">Settings</div><button class="txtbtn r" data-a="x">Done</button></header>
     <div class="scroll">
-      ${!standalone ? `<div class="banner">${ic('share')}<span>Install: tap Share, then <b>Add to Home Screen</b>. Installed, Daybook works offline and your entries are protected from Safari's storage cleanup.</span></div>` : ''}
+      ${!standalone ? `<div class="banner">${ic('share')}<span>${IS_MAC ? `Install: in Safari, click the Share button and choose <b>Add to Dock</b> (in Chrome, the install icon at the right end of the address bar). Installed, Daybook opens in its own window and works offline.` : `Install: tap Share, then <b>Add to Home Screen</b>. Installed, Daybook works offline and your entries are protected from Safari's storage cleanup.`}</span></div>` : ''}
       <div class="stats"><div class="card"><b>${st.entries}</b><small>entries</small></div><div class="card"><b>${st.days}</b><small>days</small></div><div class="card"><b>${st.photos}</b><small>photos</small></div></div>
       <p class="note">${first ? `Journaling since ${esc(fmtShort(first))}. ` : ''}${st.words.toLocaleString()} words. Current streak ${st.streak} day${st.streak === 1 ? '' : 's'}.</p>
 
@@ -813,18 +1300,29 @@ async function openSettings() {
         ${S.journals.map((j) => { const n = all.filter((e) => e.journal === j.id).length; return `<button data-rename="${j.id}">${ic('book')}${esc(j.name)}<span class="sub">${n} · Rename</span></button>`; }).join('')}
         <button data-a="add-j">${ic('plus')}New journal</button></div></div>
 
+      <div class="group"><h3>Sync with your other device</h3><div class="card">
+        <button data-a="sync-send">${ic('share')}Send changes<span class="sub">${lastSent ? `${pending} since ${esc(fmtShort(new Date(lastSent)))}` : 'Everything (first time)'}</span></button>
+        ${lastSent ? `<button data-a="sync-all">${ic('db')}Send everything</button>` : ''}
+        <label style="cursor:pointer">${ic('in')}Open a sync file<span class="sub">${lastIn ? `Last from ${esc(lastIn.from)}, ${esc(fmtShort(new Date(lastIn.at)))}` : ''}</span><input type="file" accept=".zip,application/zip" hidden id="imp-sync"></label>
+      </div><p class="note">To write on your Mac and your iPhone, keep Daybook on both and pass a sync file between them: <b>Send changes</b> on one, AirDrop the file, then <b>Open a sync file</b> on the other. Do it each way when you switch devices. New entries, edits, photos and deletions carry over. If the same entry was changed on both devices, both versions are kept and the extra copy is tagged #sync-conflict. The file goes only where you send it.</p></div>
+
       <div class="group"><h3>Backup and export</h3><div class="card">
         <button data-a="backup">${ic('db')}Back up now<span class="sub">${S.lastBackup ? 'Last ' + esc(fmtShort(new Date(S.lastBackup))) : 'Never'}</span></button>
         <button data-a="md">${ic('doc')}Export as Markdown</button>
         <label style="cursor:pointer">${ic('in')}Import backup or Day One export<input type="file" accept=".zip,.json,application/zip,application/json" hidden id="imp"></label>
       </div><p class="note">The backup is a .zip in Day One's export format (JSON plus a photos folder), so it restores here or imports into Day One.</p></div>
 
+      <div class="group"><h3>Places and sharing</h3><div class="card">
+        <button data-a="share">${ic('share')}Share a trip as a web page</button>
+        <label>${ic('pin')}Place new camera photos where I am<input type="checkbox" id="autotag" class="sub" ${S.autoTag ? 'checked' : ''}></label>
+      </div><p class="note">When a photo carries its location, Daybook uses it. iPhone removes the location from photos you add here, so Daybook places a photo taken in the last 30 minutes where ${HERE} is. Any photo can be placed by ${tap}ping the pin on the photo in the editor.</p></div>
+
       <div class="group"><h3>Privacy</h3><div class="card">
         <button data-a="lock">${ic('lock')}${S.lock ? 'Change passcode' : 'Set a passcode'}</button>
         ${S.lock ? `<label>${ic('clock')}Lock after<select id="lock-after" class="sub" style="border:0;background:transparent">
           ${[[0, 'Immediately'], [1, '1 minute'], [5, '5 minutes'], [15, '15 minutes']].map(([v, t]) => `<option value="${v}" ${S.lockAfter === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
           <button data-a="unlock-off" style="color:var(--danger)">${ic('lock')}Turn off passcode</button>` : ''}
-      </div><p class="note">The passcode is a privacy screen for someone holding your unlocked phone. It does not encrypt the data. If you forget it, the only way in is deleting the app, which erases everything not in a backup.</p></div>
+      </div><p class="note">The passcode is a privacy screen for someone using your unlocked ${DEVICE === 'iPhone' ? 'phone' : DEVICE}. It does not encrypt the data. If you forget it, the only way in is deleting the app, which erases everything not in a backup.</p></div>
 
       <div class="group"><h3>Recently deleted</h3><div class="card">
         ${trash.length ? trash.sort((a, b) => new Date(b.deleted) - new Date(a.deleted)).map((e) => `<div>${esc((titleSnip(e.text).title || 'Untitled').slice(0, 40))}<span class="sub"><button style="color:var(--accent);font-weight:600" data-restore="${e.id}">Restore</button> · <button style="color:var(--danger)" data-purge="${e.id}">Delete</button></span></div>`).join('')
@@ -832,21 +1330,22 @@ async function openSettings() {
       </div></div>
 
       <div class="group"><h3>Storage</h3><div class="card">
-        <div>${ic('db')}On this phone<span class="sub">${est && est.usage != null ? fmtBytes(est.usage) + ' used' : 'Unknown'}</span></div>
-        <div>${ic('lock')}Protected from cleanup<span class="sub">${persisted === true ? 'Yes' : standalone ? 'Home Screen app' : 'No: add to Home Screen'}</span></div>
+        <div>${ic('db')}On ${HERE}<span class="sub">${est && est.usage != null ? fmtBytes(est.usage) + ' used' : 'Unknown'}</span></div>
+        <div>${ic('lock')}Protected from cleanup<span class="sub">${persisted === true ? 'Yes' : IS_MAC ? 'Not confirmed' : standalone ? 'Home Screen app' : 'No: add to Home Screen'}</span></div>
       </div></div>
-      <p class="note" style="text-align:center;margin:22px 0">Daybook ${APP_VERSION} · works offline · no account, no tracking, no network calls</p>
+      <p class="note" style="text-align:center;margin:22px 0">Daybook ${APP_VERSION} · works offline · no account, no tracking. Your writing never leaves ${HERE} unless you share it or send a sync file. With a connection, the Map tab loads map tiles from OpenFreeMap, which sees the area being viewed.</p>
     </div>`;
   };
   await paint();
   el.addEventListener('change', async (ev) => {
+    if (ev.target.id === 'autotag') { S.autoTag = ev.target.checked; await DB.setMeta('autoTag', S.autoTag); toast('Saved'); }
     if (ev.target.id === 'lock-after') { S.lockAfter = +ev.target.value; await DB.setMeta('lockAfter', S.lockAfter); toast('Saved'); }
-    if (ev.target.id === 'imp') {
+    if (ev.target.id === 'imp' || ev.target.id === 'imp-sync') {
       const f = ev.target.files[0]; ev.target.value = ''; if (!f) return;
       toast('Importing…', 60000);
       try {
         const r = await importFile(f);
-        toast(`Imported ${r.added} new, ${r.updated} updated, ${r.skipped} unchanged; ${r.photos} photos${r.missing ? `, ${r.missing} missing` : ''}`, 6000);
+        toast(`${r.sync ? 'Synced' : 'Imported'}: ${r.added} new, ${r.updated} updated, ${r.skipped} unchanged${r.deleted ? `, ${r.deleted} moved to Recently Deleted` : ''}${r.removed ? `, ${r.removed} deleted` : ''}; ${r.photos} photos${r.missing ? `, ${r.missing} missing` : ''}${r.conflicts ? `. ${r.conflicts} changed on both devices: both versions kept, tagged #sync-conflict` : ''}`, r.conflicts ? 9000 : 6000);
         render(); await paint();
       } catch (err) { toast('Import failed: ' + err.message, 6000); }
     }
@@ -863,6 +1362,9 @@ async function openSettings() {
       case 'x': el.remove(); render(); break;
       case 'add-j': { const n = prompt('Name for the new journal'); if (n && n.trim()) { S.journals.push({ id: uuid(), name: n.trim() }); await DB.setMeta('journals', S.journals); render(); await paint(); } break; }
       case 'backup': await doBackup(); break;
+      case 'sync-send': await sendSync(false, paint); break;
+      case 'sync-all': await sendSync(true, paint); break;
+      case 'share': openShare(); break;
       case 'md': offerFile(buildMarkdown(), `Daybook-${dayKey(new Date())}.md`, 'All entries as readable text'); break;
       case 'lock': { if (S.lock && !(await passcodeFlow('verify'))) break; const code = await passcodeFlow('set'); if (code) { await setPasscode(code); toast('Passcode on'); await paint(); } break; }
       case 'unlock-off': { const ok = await passcodeFlow('verify'); if (ok) { S.lock = null; await DB.setMeta('lock', null); toast('Passcode off'); await paint(); } break; }
@@ -934,13 +1436,43 @@ function wire() {
       case 'write-day': openEditor(null, S.calSel); break;
       case 'f-star': S.search.starred = !S.search.starred; renderSearchResults(); break;
       case 'backup': doBackup(); break;
+      case 'share': openShare(); break;
       case 'update': if (S.updateReady) { S.updateReady.postMessage('skipWaiting'); } break;
     }
   });
+  document.addEventListener('keydown', onKey);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) S.hiddenAt = Date.now();
     else if (S.lock && Date.now() - S.hiddenAt >= S.lockAfter * 60000) lockNow();
   });
+}
+
+// keyboard, for use on a Mac: N new entry, / search, E edit the open entry, Esc close, Cmd+Enter or Cmd+S finish editing
+function onKey(ev) {
+  const lock = $('#lock');
+  if (lock) {
+    const k = /^[0-9]$/.test(ev.key) ? ev.key : ev.key === 'Backspace' ? 'b' : ev.key === 'Escape' ? 'c' : null;
+    const b = k && $(`[data-k="${k}"]`, lock); if (b) { ev.preventDefault(); b.click(); }
+    return;
+  }
+  const viewer = $('#viewer'); if (viewer && ev.key === 'Escape') { viewer.remove(); return; }
+  const sheets = $$('.sheet'), top = sheets[sheets.length - 1];
+  const mod = ev.metaKey || ev.ctrlKey;
+  if (top && top._done && mod && (ev.key === 'Enter' || ev.key.toLowerCase() === 's')) { ev.preventDefault(); top._done(); return; }
+  if (ev.key === 'Escape' && top) {
+    const pop = $('#ed-pop', top);
+    if (pop && pop.innerHTML) { pop.innerHTML = ''; pop.dataset.open = ''; return; }
+    ev.preventDefault();
+    if (top._done) return top._done();
+    const b = $('header [data-a=back], header [data-a=x]', top); if (b) b.click();
+    return;
+  }
+  const typing = ev.target.closest && ev.target.closest('input, textarea, select, [contenteditable]');
+  if (typing || mod || ev.altKey) return;
+  if (top && top.dataset.reader && ev.key.toLowerCase() === 'e') { ev.preventDefault(); const b = $('[data-a=edit]', top); if (b) b.click(); return; }
+  if (top) return;
+  if (ev.key.toLowerCase() === 'n') { ev.preventDefault(); $('#btn-new').click(); }
+  if (ev.key === '/') { ev.preventDefault(); $('nav.tabs [data-view=search]').click(); setTimeout(() => { const i = $('#main input[type=search]'); if (i) i.focus(); }, 50); }
 }
 
 function registerSW() {
